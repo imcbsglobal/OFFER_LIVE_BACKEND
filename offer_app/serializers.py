@@ -1,52 +1,15 @@
-# /mnt/data/serializers.py
+# serializers.py
 from rest_framework import serializers
 from django.contrib.auth import authenticate
-from .models import User, Category, Product, Offer
-
-
-# ---------------- LOGIN SERIALIZER (REQUIRED) ----------------
-class LoginSerializer(serializers.Serializer):
-    # accept either 'email' or 'username' (email preferred)
-    email = serializers.EmailField(required=False, allow_blank=True)
-    username = serializers.CharField(required=False, allow_blank=True)
-    password = serializers.CharField()
-
-    def validate(self, data):
-        email = data.get("email")
-        username = data.get("username")
-        password = data.get("password")
-
-        if not password:
-            raise serializers.ValidationError("Password is required.")
-
-        if not email and not username:
-            raise serializers.ValidationError("Provide email or username and password.")
-
-        # If email provided -> lookup user by email, then authenticate using username
-        if email:
-            try:
-                user_obj = User.objects.get(email=email)
-            except User.DoesNotExist:
-                raise serializers.ValidationError("Invalid email or user not found.")
-            user = authenticate(username=user_obj.username, password=password)
-            if user is None:
-                raise serializers.ValidationError("Incorrect password.")
-        else:
-            # username login path
-            user = authenticate(username=username, password=password)
-            if user is None:
-                raise serializers.ValidationError("Invalid username or password.")
-
-        # At this point authentication succeeded and we have a user instance
-        data["user"] = user
-        return data
+from .models import User, Category, Product, Offer, OfferMaster, OfferMasterMedia, BranchMaster
 
 
 # ---------------- USER SERIALIZERS ----------------
+
 class UserRegistrationSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ('username', 'email', 'password', 'shop_name')
+        fields = ("username", "email", "password", "shop_name")
         extra_kwargs = {"password": {"write_only": True}}
 
     def create(self, validated_data):
@@ -57,13 +20,118 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         return user
 
 
-class UserSerializer(serializers.ModelSerializer):
+class UserPublicSerializer(serializers.ModelSerializer):
+    """
+    Safe user payload for frontend. Do NOT expose __all__ on login.
+    """
     class Meta:
         model = User
-        fields = "__all__"
+        fields = (
+            "id",
+            "username",
+            "email",
+            "user_type",
+            "status",
+            "shop_name",
+            "business_name",
+            "phone_number",
+            "location",
+            "shop_logo",
+            "amount",
+            "no_days",
+            "validity_start",
+            "validity_end",
+            "created_date",
+            "date_joined",
+        )
+
+
+class UserSimpleSerializer(serializers.ModelSerializer):
+    """
+    Simple user serializer for dropdowns/listings
+    """
+    class Meta:
+        model = User
+        fields = ('id', 'username', 'shop_name', 'email')
+
+
+class UserSerializer(serializers.ModelSerializer):
+    """
+    For admin/internal use — excludes sensitive fields like password and is_superuser.
+    ✅ FIX: Changed from fields = "__all__" to explicit safe fields only.
+    Previously this was exposing the password hash and superuser flags to the frontend.
+    """
+    class Meta:
+        model = User
+        fields = (
+            "id",
+            "username",
+            "email",
+            "user_type",
+            "status",
+            "shop_name",
+            "business_name",
+            "phone_number",
+            "location",
+            "shop_logo",
+            "amount",
+            "no_days",
+            "validity_start",
+            "validity_end",
+            "is_active",
+            "is_staff",
+            "created_date",
+            "date_joined",
+        )
+        extra_kwargs = {
+            "password": {"write_only": True},  # safety net — never expose password hash
+        }
+
+
+# ---------------- LOGIN SERIALIZER ----------------
+
+class LoginSerializer(serializers.Serializer):
+    email = serializers.EmailField(required=False, allow_blank=True)
+    username = serializers.CharField(required=False, allow_blank=True)
+    password = serializers.CharField()
+
+    def validate(self, data):
+        email = (data.get("email") or "").strip()
+        username = (data.get("username") or "").strip()
+        password = data.get("password")
+
+        if not password:
+            raise serializers.ValidationError({"error": "Password is required."})
+
+        if not email and not username:
+            raise serializers.ValidationError({"error": "Provide email or username and password."})
+
+        # Email login path
+        if email:
+            qs = User.objects.filter(email__iexact=email)
+
+            if not qs.exists():
+                raise serializers.ValidationError({"error": "Invalid email or user not found."})
+
+            if qs.count() > 1:
+                raise serializers.ValidationError({"error": "Multiple accounts use this email. Contact admin."})
+
+            user_obj = qs.first()
+            user = authenticate(username=user_obj.username, password=password)
+            if user is None:
+                raise serializers.ValidationError({"error": "Incorrect password."})
+        else:
+            # Username login path
+            user = authenticate(username=username, password=password)
+            if user is None:
+                raise serializers.ValidationError({"error": "Invalid username or password."})
+
+        data["user"] = user
+        return data
 
 
 # ---------------- CATEGORY SERIALIZER ----------------
+
 class CategorySerializer(serializers.ModelSerializer):
     class Meta:
         model = Category
@@ -71,18 +139,19 @@ class CategorySerializer(serializers.ModelSerializer):
 
 
 # ---------------- PRODUCT SERIALIZERS ----------------
+
 class ProductCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = (
-            'product_name',
-            'brand',
-            'category',
-            'original_price',
-            'offer_price',
-            'valid_until',
-            'template_type',
-            'image'
+            "product_name",
+            "brand",
+            "category",
+            "original_price",
+            "offer_price",
+            "valid_until",
+            "template_type",
+            "image",
         )
 
 
@@ -92,21 +161,20 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 
-# ------------- OFFER SERIALIZERS ----------------
+# ---------------- OFFER SERIALIZERS ----------------
+
 class OfferSerializer(serializers.ModelSerializer):
     class Meta:
         model = Offer
         fields = "__all__"
 
 
-# Template serializer for old product-based offer view
 class OfferTemplateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = "__all__"
 
 
-# ------------- NEW MULTI-PRODUCT OFFER CREATE ----------------
 class OfferCreateSerializer(serializers.Serializer):
     category_id = serializers.IntegerField(required=False, allow_null=True)
     template_type = serializers.CharField()
@@ -114,7 +182,7 @@ class OfferCreateSerializer(serializers.Serializer):
 
     def validate(self, data):
         if not data.get("product_ids"):
-            raise serializers.ValidationError("At least one product required")
+            raise serializers.ValidationError({"error": "At least one product required"})
         return data
 
     def create(self, validated_data):
@@ -127,17 +195,15 @@ class OfferCreateSerializer(serializers.Serializer):
         offer = Offer.objects.create(
             user=user,
             category=category,
-            template_type=validated_data["template_type"]
+            template_type=validated_data["template_type"],
         )
 
         products = Product.objects.filter(id__in=validated_data["product_ids"], user=user)
         offer.products.set(products)
         offer.save()
-
         return offer
 
 
-# ------------- PUBLIC OFFER SERIALIZER ----------------
 class OfferPublicSerializer(serializers.ModelSerializer):
     products = ProductSerializer(many=True)
     category = CategorySerializer()
@@ -154,10 +220,402 @@ class OfferPublicSerializer(serializers.ModelSerializer):
             "offer_link",
             "qr_url",
             "created_at",
-            "is_public"
+            "is_public",
         )
 
     def get_qr_url(self, obj):
+        return obj.qr_code.url if obj.qr_code else None
+
+
+# ---------------- BRANCH MASTER SERIALIZERS ----------------
+
+class BranchMasterSerializer(serializers.ModelSerializer):
+    """
+    Serializer for reading/listing BranchMaster
+    Includes user/shop owner information
+    """
+    branch_image_url = serializers.SerializerMethodField()
+    qr_code_url = serializers.SerializerMethodField()        # ✅ NEW
+    branch_offers_url = serializers.SerializerMethodField()  # ✅ NEW
+    user_info = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BranchMaster
+        fields = [
+            'id',
+            'user',
+            'user_info',
+            'branch_name',
+            'branch_code',
+            'location',
+            'address',
+            'city',
+            'state',
+            'pincode',
+            'country',
+            'contact_number',
+            'email',
+            'manager_name',
+            'manager_phone',
+            'status',
+            'branch_image',
+            'branch_image_url',
+            'qr_code_url',       # ✅ NEW
+            'branch_offers_url', # ✅ NEW
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_branch_image_url(self, obj):
+        """Return the full URL for the branch image"""
+        if obj.branch_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.branch_image.url)
+            return obj.branch_image.url
+        return None
+
+    def get_qr_code_url(self, obj):
+        """Return absolute URL of the branch QR code image (for displaying/printing in admin)."""
         if obj.qr_code:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.qr_code.url)
             return obj.qr_code.url
         return None
+
+    def get_branch_offers_url(self, obj):
+        """Return the public URL that the QR encodes (the customer-facing page)."""
+        return obj.get_public_url()
+
+    def get_user_info(self, obj):
+        """Return user/shop owner information"""
+        return {
+            'id': obj.user.id,
+            'username': obj.user.username,
+            'shop_name': obj.user.shop_name or obj.user.username,
+            'email': obj.user.email
+        }
+
+
+class BranchMasterCreateUpdateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for creating/updating BranchMaster
+    Admin specifies which user/shop the branch belongs to
+    """
+    branch_image = serializers.ImageField(required=False, allow_null=True)
+
+    class Meta:
+        model = BranchMaster
+        fields = [
+            'user',  # Admin selects the user
+            'branch_name',
+            'branch_code',
+            'location',
+            'address',
+            'city',
+            'state',
+            'pincode',
+            'country',
+            'contact_number',
+            'email',
+            'manager_name',
+            'manager_phone',
+            'status',
+            'branch_image'
+        ]
+
+    def validate_branch_code(self, value):
+        """Validate that branch_code is unique"""
+        instance = self.instance
+        if instance:
+            if BranchMaster.objects.filter(branch_code=value).exclude(id=instance.id).exists():
+                raise serializers.ValidationError('A branch with this code already exists.')
+        else:
+            if BranchMaster.objects.filter(branch_code=value).exists():
+                raise serializers.ValidationError('A branch with this code already exists.')
+        return value
+
+    def validate_branch_image(self, value):
+        """Validate branch image file"""
+        if value:
+            max_size = 5 * 1024 * 1024  # 5MB
+            if value.size > max_size:
+                raise serializers.ValidationError('Image file is too large. Maximum size is 5MB.')
+            
+            file_extension = value.name.split('.')[-1].lower()
+            allowed_extensions = ['jpg', 'jpeg', 'png', 'webp']
+            
+            if file_extension not in allowed_extensions:
+                raise serializers.ValidationError(
+                    f'File type .{file_extension} is not allowed. Allowed types: {", ".join(allowed_extensions)}'
+                )
+        
+        return value
+
+
+# ---------------- OFFER MASTER MEDIA SERIALIZER ----------------
+
+class OfferMasterMediaSerializer(serializers.ModelSerializer):
+    """
+    Serializer for individual media files (images/PDFs) attached to OfferMaster
+    """
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OfferMasterMedia
+        fields = [
+            'id',
+            'file',
+            'file_url',
+            'media_type',
+            'order',
+            'caption',
+            'uploaded_at'
+        ]
+        read_only_fields = ['id', 'uploaded_at', 'media_type']
+
+    def get_file_url(self, obj):
+        """Return the full URL for the file"""
+        if obj.file:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.file.url)
+            return obj.file.url
+        return None
+
+
+# ---------------- OFFER MASTER SERIALIZERS (UPDATED WITH BRANCHES) ----------------
+
+class OfferMasterSerializer(serializers.ModelSerializer):
+    """
+    Serializer for reading/listing OfferMaster with all media files and branches
+    """
+    media_files = OfferMasterMediaSerializer(many=True, read_only=True)
+    media_count = serializers.SerializerMethodField()
+    branches = BranchMasterSerializer(many=True, read_only=True)
+    branch_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = OfferMaster
+        fields = [
+            'id',
+            'title',
+            'description',
+            'valid_from',
+            'valid_to',
+            'status',
+            'media_files',
+            'media_count',
+            'branches',
+            'branch_count',
+            'created_at',
+            'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def get_media_count(self, obj):
+        """Return the total number of media files"""
+        return obj.media_files.count()
+    
+    def get_branch_count(self, obj):
+        """Return the total number of branches"""
+        return obj.branches.count()
+
+
+class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
+    """
+    Serializer for creating/updating OfferMaster with multiple file uploads and branch assignment
+    """
+    files = serializers.ListField(
+        child=serializers.FileField(),
+        write_only=True,
+        required=False,
+        help_text="List of image/PDF files to upload"
+    )
+    captions = serializers.ListField(
+        child=serializers.CharField(allow_blank=True),
+        write_only=True,
+        required=False,
+        help_text="Optional captions for each file (must match files count)"
+    )
+    branch_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        write_only=True,
+        required=False,
+        help_text="List of branch IDs to assign this offer to"
+    )
+
+    class Meta:
+        model = OfferMaster
+        fields = [
+            'title',
+            'description',
+            'valid_from',
+            'valid_to',
+            'status',
+            'files',
+            'captions',
+            'branch_ids'
+        ]
+
+    def validate(self, data):
+        """Validate the data before creating/updating"""
+        if data.get('valid_from') and data.get('valid_to'):
+            if data['valid_to'] < data['valid_from']:
+                raise serializers.ValidationError({
+                    'valid_to': 'End date must be after start date.'
+                })
+        
+        files = data.get('files', [])
+        if files:
+            for file in files:
+                file_extension = file.name.split('.')[-1].lower()
+                allowed_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf']
+                
+                if file_extension not in allowed_extensions:
+                    raise serializers.ValidationError({
+                        'files': f'File type .{file_extension} is not allowed. Allowed types: {", ".join(allowed_extensions)}'
+                    })
+                
+                max_size = 10 * 1024 * 1024  # 10MB
+                if file.size > max_size:
+                    raise serializers.ValidationError({
+                        'files': f'File {file.name} is too large. Maximum size is 10MB.'
+                    })
+        
+        # Validate branch IDs
+        branch_ids = data.get('branch_ids', [])
+        if branch_ids:
+            # Verify all branches exist
+            existing_branches = BranchMaster.objects.filter(id__in=branch_ids)
+            if existing_branches.count() != len(branch_ids):
+                raise serializers.ValidationError({
+                    'branch_ids': 'Some branch IDs are invalid.'
+                })
+        
+        return data
+
+    def create(self, validated_data):
+        """Create OfferMaster and associated media files and branch assignments"""
+        files = validated_data.pop('files', [])
+        captions = validated_data.pop('captions', [])
+        branch_ids = validated_data.pop('branch_ids', [])
+        
+        offer_master = OfferMaster.objects.create(**validated_data)
+        
+        # Assign branches
+        if branch_ids:
+            branches = BranchMaster.objects.filter(id__in=branch_ids)
+            offer_master.branches.set(branches)
+        
+        # Create media files
+        for index, file in enumerate(files):
+            caption = captions[index] if index < len(captions) else ''
+            OfferMasterMedia.objects.create(
+                offer_master=offer_master,
+                file=file,
+                order=index,
+                caption=caption
+            )
+        
+        return offer_master
+
+    def update(self, instance, validated_data):
+        """Update OfferMaster and add new media files (existing files remain) and update branch assignments"""
+        files = validated_data.pop('files', None)
+        captions = validated_data.pop('captions', [])
+        branch_ids = validated_data.pop('branch_ids', None)
+        
+        # Update basic fields
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        
+        # Update branch assignments if provided
+        if branch_ids is not None:
+            branches = BranchMaster.objects.filter(id__in=branch_ids)
+            instance.branches.set(branches)
+        
+        # Add new media files
+        if files:
+            from django.db.models import Max
+            current_max_order = instance.media_files.aggregate(
+                Max('order')
+            )['order__max']
+            
+            if current_max_order is None:
+                current_max_order = -1
+            
+            for index, file in enumerate(files):
+                caption = captions[index] if index < len(captions) else ''
+                OfferMasterMedia.objects.create(
+                    offer_master=instance,
+                    file=file,
+                    order=current_max_order + index + 1,
+                    caption=caption
+                )
+        
+        return instance
+
+
+# ---------------- BRANCH WITH OFFERS SERIALIZER (NEW) ----------------
+
+class BranchWithOffersSerializer(serializers.ModelSerializer):
+    """
+    Serializer for Branch with its assigned offers
+    Used for public discovery - shows branch, shop info, and active offers
+    """
+    active_offers = serializers.SerializerMethodField()
+    offers_count = serializers.SerializerMethodField()
+    branch_image_url = serializers.SerializerMethodField()
+    shop_name = serializers.SerializerMethodField()
+    user_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BranchMaster
+        fields = [
+            'id',
+            'user_id',
+            'shop_name',
+            'branch_name',
+            'branch_code',
+            'location',
+            'address',
+            'city',
+            'state',
+            'contact_number',
+            'email',
+            'status',
+            'branch_image',
+            'branch_image_url',
+            'active_offers',
+            'offers_count'
+        ]
+    
+    def get_active_offers(self, obj):
+        """Return only active offers for this branch"""
+        active_offers = obj.offers.filter(status='active')
+        return OfferMasterSerializer(active_offers, many=True, context=self.context).data
+
+    def get_offers_count(self, obj):
+        """Return count of active offers"""
+        return obj.offers.filter(status='active').count()
+
+    def get_branch_image_url(self, obj):
+        """Return the full URL for the branch image"""
+        if obj.branch_image:
+            request = self.context.get('request')
+            if request:
+                return request.build_absolute_uri(obj.branch_image.url)
+            return obj.branch_image.url
+        return None
+    
+    def get_shop_name(self, obj):
+        """Return the shop/business name"""
+        return obj.user.shop_name or obj.user.business_name or obj.user.username
+    
+    def get_user_id(self, obj):
+        """Return the user ID"""
+        return obj.user.id

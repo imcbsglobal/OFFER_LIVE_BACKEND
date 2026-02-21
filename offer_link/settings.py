@@ -9,9 +9,12 @@ SECRET_KEY = 'django-insecure-your-secret-key-here-change-in-production'
 
 DEBUG = True
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1', '0.0.0.0','192.168.1.33']
-# Add after MEDIA_ROOT
-SITE_URL = 'http://localhost:5173'  # Your frontend URL
+ALLOWED_HOSTS = [
+    "127.0.0.1",
+    "localhost",
+    "192.168.1.45",  # ✅ Updated to correct local IP
+]
+
 
 # Application definition
 INSTALLED_APPS = [
@@ -21,18 +24,18 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    
+
     # Third party apps
     'rest_framework',
     'corsheaders',
     'rest_framework_simplejwt',
-    
+
     # Local apps
     'offer_app',
 ]
 
 MIDDLEWARE = [
-    'corsheaders.middleware.CorsMiddleware',
+    'corsheaders.middleware.CorsMiddleware',  # Must be first
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -65,8 +68,12 @@ WSGI_APPLICATION = 'offer_link.wsgi.application'
 # Database
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': 'offer_live',
+        'USER': 'postgres',
+        'PASSWORD': '12345',
+        'HOST': 'localhost',
+        'PORT': '5432',
     }
 }
 
@@ -92,7 +99,7 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 USE_TZ = True
 
-# Static files (CSS, JavaScript, Images)
+# Static files
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
@@ -144,20 +151,26 @@ SIMPLE_JWT = {
     'USER_ID_CLAIM': 'user_id',
 }
 
-# CORS settings
+# ✅ CORS — single definition, correct IP, all needed origins
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://192.168.1.45:5173",  # ✅ Local network frontend
+    "http://192.168.1.45:3000",  # ✅ Local network (if using port 3000)
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True  # Only for development!
+CORS_ALLOW_ALL_ORIGINS = True  # ✅ Keep True during development for ease
 CORS_ALLOW_CREDENTIALS = True
 
 # File upload settings
-FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
-DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
+
+# ✅ Site URLs — correct IP, correct ports
+SITE_URL = 'http://192.168.1.45:8000'    # Django backend — used for QR/API links
+FRONTEND_URL = 'http://192.168.1.45:5173'  # React frontend
 
 # Logging configuration
 LOGGING = {
@@ -180,8 +193,3 @@ LOGGING = {
         },
     },
 }
-# File: Offer_Link_backend/offer_link/settings.py
-
-# Add these lines:
-FRONTEND_URL = 'http://localhost:5173'
-SITE_URL = 'http://localhost:5173'  # For QR code links

@@ -1,5 +1,5 @@
 from django.contrib import admin
-from .models import User, Category, Product, Offer
+from .models import User, Category, Product, Offer, BranchMaster, OfferMaster, OfferMasterMedia
 
 
 @admin.register(User)
@@ -22,3 +22,28 @@ class ProductAdmin(admin.ModelAdmin):
 class OfferAdmin(admin.ModelAdmin):
     list_display = ('id', 'user', 'template_type', 'created_at', 'is_public')
     filter_horizontal = ('products',)
+
+
+# ✅ FIX: BranchMaster, OfferMaster, OfferMasterMedia were missing from admin
+# Without these, you cannot manage branches or offer masters from the Django admin panel
+
+@admin.register(BranchMaster)
+class BranchMasterAdmin(admin.ModelAdmin):
+    list_display = ('branch_name', 'branch_code', 'user', 'location', 'city', 'status', 'created_at')
+    list_filter = ('status', 'city', 'state', 'country')
+    search_fields = ('branch_name', 'branch_code', 'user__username', 'user__shop_name', 'location')
+
+
+@admin.register(OfferMaster)
+class OfferMasterAdmin(admin.ModelAdmin):
+    list_display = ('title', 'user', 'status', 'valid_from', 'valid_to', 'created_at')
+    list_filter = ('status',)
+    search_fields = ('title', 'user__username', 'user__shop_name')
+    filter_horizontal = ('branches',)
+
+
+@admin.register(OfferMasterMedia)
+class OfferMasterMediaAdmin(admin.ModelAdmin):
+    list_display = ('offer_master', 'media_type', 'order', 'caption', 'uploaded_at')
+    list_filter = ('media_type',)
+    search_fields = ('offer_master__title', 'caption')
