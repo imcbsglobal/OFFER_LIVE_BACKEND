@@ -1,6 +1,7 @@
 # serializers.py
 from rest_framework import serializers
 from django.contrib.auth import authenticate
+from django.utils import timezone
 from .models import User, Category, Product, Offer, OfferMaster, OfferMasterMedia, BranchMaster
 
 
@@ -235,8 +236,8 @@ class BranchMasterSerializer(serializers.ModelSerializer):
     Includes user/shop owner information
     """
     branch_image_url = serializers.SerializerMethodField()
-    qr_code_url = serializers.SerializerMethodField()        # ✅ NEW
-    branch_offers_url = serializers.SerializerMethodField()  # ✅ NEW
+    qr_code_url = serializers.SerializerMethodField()
+    branch_offers_url = serializers.SerializerMethodField()
     user_info = serializers.SerializerMethodField()
 
     class Meta:
@@ -260,15 +261,14 @@ class BranchMasterSerializer(serializers.ModelSerializer):
             'status',
             'branch_image',
             'branch_image_url',
-            'qr_code_url',       # ✅ NEW
-            'branch_offers_url', # ✅ NEW
+            'qr_code_url',
+            'branch_offers_url',
             'created_at',
             'updated_at'
         ]
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_branch_image_url(self, obj):
-        """Return the full URL for the branch image"""
         if obj.branch_image:
             request = self.context.get('request')
             if request:
@@ -277,7 +277,6 @@ class BranchMasterSerializer(serializers.ModelSerializer):
         return None
 
     def get_qr_code_url(self, obj):
-        """Return absolute URL of the branch QR code image (for displaying/printing in admin)."""
         if obj.qr_code:
             request = self.context.get('request')
             if request:
@@ -286,11 +285,9 @@ class BranchMasterSerializer(serializers.ModelSerializer):
         return None
 
     def get_branch_offers_url(self, obj):
-        """Return the public URL that the QR encodes (the customer-facing page)."""
         return obj.get_public_url()
 
     def get_user_info(self, obj):
-        """Return user/shop owner information"""
         return {
             'id': obj.user.id,
             'username': obj.user.username,
@@ -309,7 +306,7 @@ class BranchMasterCreateUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = BranchMaster
         fields = [
-            'user',  # Admin selects the user
+            'user',
             'branch_name',
             'branch_code',
             'location',
@@ -327,7 +324,6 @@ class BranchMasterCreateUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def validate_branch_code(self, value):
-        """Validate that branch_code is unique"""
         instance = self.instance
         if instance:
             if BranchMaster.objects.filter(branch_code=value).exclude(id=instance.id).exists():
@@ -338,29 +334,22 @@ class BranchMasterCreateUpdateSerializer(serializers.ModelSerializer):
         return value
 
     def validate_branch_image(self, value):
-        """Validate branch image file"""
         if value:
             max_size = 5 * 1024 * 1024  # 5MB
             if value.size > max_size:
                 raise serializers.ValidationError('Image file is too large. Maximum size is 5MB.')
-            
             file_extension = value.name.split('.')[-1].lower()
             allowed_extensions = ['jpg', 'jpeg', 'png', 'webp']
-            
             if file_extension not in allowed_extensions:
                 raise serializers.ValidationError(
                     f'File type .{file_extension} is not allowed. Allowed types: {", ".join(allowed_extensions)}'
                 )
-        
         return value
 
 
 # ---------------- OFFER MASTER MEDIA SERIALIZER ----------------
 
 class OfferMasterMediaSerializer(serializers.ModelSerializer):
-    """
-    Serializer for individual media files (images/PDFs) attached to OfferMaster
-    """
     file_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -377,7 +366,6 @@ class OfferMasterMediaSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'uploaded_at', 'media_type']
 
     def get_file_url(self, obj):
-        """Return the full URL for the file"""
         if obj.file:
             request = self.context.get('request')
             if request:
@@ -386,7 +374,7 @@ class OfferMasterMediaSerializer(serializers.ModelSerializer):
         return None
 
 
-# ---------------- OFFER MASTER SERIALIZERS (UPDATED WITH BRANCHES) ----------------
+# ---------------- OFFER MASTER SERIALIZERS ----------------
 
 class OfferMasterSerializer(serializers.ModelSerializer):
     """
@@ -416,11 +404,9 @@ class OfferMasterSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at', 'updated_at']
 
     def get_media_count(self, obj):
-        """Return the total number of media files"""
         return obj.media_files.count()
-    
+
     def get_branch_count(self, obj):
-        """Return the total number of branches"""
         return obj.branches.count()
 
 
@@ -461,56 +447,48 @@ class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, data):
-        """Validate the data before creating/updating"""
         if data.get('valid_from') and data.get('valid_to'):
             if data['valid_to'] < data['valid_from']:
                 raise serializers.ValidationError({
                     'valid_to': 'End date must be after start date.'
                 })
-        
+
         files = data.get('files', [])
         if files:
             for file in files:
                 file_extension = file.name.split('.')[-1].lower()
                 allowed_extensions = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'pdf']
-                
                 if file_extension not in allowed_extensions:
                     raise serializers.ValidationError({
                         'files': f'File type .{file_extension} is not allowed. Allowed types: {", ".join(allowed_extensions)}'
                     })
-                
                 max_size = 10 * 1024 * 1024  # 10MB
                 if file.size > max_size:
                     raise serializers.ValidationError({
                         'files': f'File {file.name} is too large. Maximum size is 10MB.'
                     })
-        
-        # Validate branch IDs
+
         branch_ids = data.get('branch_ids', [])
         if branch_ids:
-            # Verify all branches exist
             existing_branches = BranchMaster.objects.filter(id__in=branch_ids)
             if existing_branches.count() != len(branch_ids):
                 raise serializers.ValidationError({
                     'branch_ids': 'Some branch IDs are invalid.'
                 })
-        
+
         return data
 
     def create(self, validated_data):
-        """Create OfferMaster and associated media files and branch assignments"""
         files = validated_data.pop('files', [])
         captions = validated_data.pop('captions', [])
         branch_ids = validated_data.pop('branch_ids', [])
-        
+
         offer_master = OfferMaster.objects.create(**validated_data)
-        
-        # Assign branches
+
         if branch_ids:
             branches = BranchMaster.objects.filter(id__in=branch_ids)
             offer_master.branches.set(branches)
-        
-        # Create media files
+
         for index, file in enumerate(files):
             caption = captions[index] if index < len(captions) else ''
             OfferMasterMedia.objects.create(
@@ -519,35 +497,27 @@ class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
                 order=index,
                 caption=caption
             )
-        
+
         return offer_master
 
     def update(self, instance, validated_data):
-        """Update OfferMaster and add new media files (existing files remain) and update branch assignments"""
         files = validated_data.pop('files', None)
         captions = validated_data.pop('captions', [])
         branch_ids = validated_data.pop('branch_ids', None)
-        
-        # Update basic fields
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
-        
-        # Update branch assignments if provided
+
         if branch_ids is not None:
             branches = BranchMaster.objects.filter(id__in=branch_ids)
             instance.branches.set(branches)
-        
-        # Add new media files
+
         if files:
             from django.db.models import Max
-            current_max_order = instance.media_files.aggregate(
-                Max('order')
-            )['order__max']
-            
+            current_max_order = instance.media_files.aggregate(Max('order'))['order__max']
             if current_max_order is None:
                 current_max_order = -1
-            
             for index, file in enumerate(files):
                 caption = captions[index] if index < len(captions) else ''
                 OfferMasterMedia.objects.create(
@@ -556,16 +526,16 @@ class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
                     order=current_max_order + index + 1,
                     caption=caption
                 )
-        
+
         return instance
 
 
-# ---------------- BRANCH WITH OFFERS SERIALIZER (NEW) ----------------
+# ---------------- BRANCH WITH OFFERS SERIALIZER ----------------
 
 class BranchWithOffersSerializer(serializers.ModelSerializer):
     """
-    Serializer for Branch with its assigned offers
-    Used for public discovery - shows branch, shop info, and active offers
+    Serializer for Branch with its assigned offers.
+    Used for public discovery (QR scan landing page) — shows branch info + active, non-expired offers only.
     """
     active_offers = serializers.SerializerMethodField()
     offers_count = serializers.SerializerMethodField()
@@ -593,29 +563,32 @@ class BranchWithOffersSerializer(serializers.ModelSerializer):
             'active_offers',
             'offers_count'
         ]
-    
+
     def get_active_offers(self, obj):
-        """Return only active offers for this branch"""
-        active_offers = obj.offers.filter(status='active')
+        """Return only active, non-expired offers for this branch"""
+        today = timezone.localdate()
+        active_offers = obj.offers.filter(
+            valid_to__gte=today         # ✅ exclude expired offers by date
+        ).exclude(status='inactive').prefetch_related('media_files')
         return OfferMasterSerializer(active_offers, many=True, context=self.context).data
 
     def get_offers_count(self, obj):
-        """Return count of active offers"""
-        return obj.offers.filter(status='active').count()
+        """Return count of active, non-expired offers"""
+        today = timezone.localdate()
+        return obj.offers.filter(
+            valid_to__gte=today         # ✅ exclude expired offers by date
+        ).exclude(status='inactive').count()
 
     def get_branch_image_url(self, obj):
-        """Return the full URL for the branch image"""
         if obj.branch_image:
             request = self.context.get('request')
             if request:
                 return request.build_absolute_uri(obj.branch_image.url)
             return obj.branch_image.url
         return None
-    
+
     def get_shop_name(self, obj):
-        """Return the shop/business name"""
         return obj.user.shop_name or obj.user.business_name or obj.user.username
-    
+
     def get_user_id(self, obj):
-        """Return the user ID"""
         return obj.user.id

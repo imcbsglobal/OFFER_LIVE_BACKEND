@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser, FormParser
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.db.models import Q
+from django.utils import timezone
 import secrets
 import requests as http_requests
 
@@ -30,6 +31,23 @@ from .serializers import (
     UserSimpleSerializer,
     BranchWithOffersSerializer,
 )
+
+# ------------------ AUTO-EXPIRE OFFERS ------------------
+
+def auto_expire_offers():
+    """
+    Bulk-set status='inactive' for any OfferMaster whose valid_to date
+    has passed today. Called at the top of every view that reads offers,
+    so no cron job or Celery is needed — expiry is applied on the next
+    API hit after the date passes.
+    """
+    today = timezone.localdate()
+    expired_count = OfferMaster.objects.filter(
+        valid_to__lt=today,
+        status='active'          # only touch active ones, leave scheduled/inactive alone
+    ).update(status='inactive')
+    if expired_count:
+        print(f"[auto_expire] Marked {expired_count} offer(s) as inactive (valid_to passed).")
 
 # ------------------ PERMISSIONS ------------------
 
@@ -70,26 +88,90 @@ def admin_login(request):
     })
 
 
+# ─── Debtors API ──────────────────────────────────────────────────────────────
+
+DEBTORS_API_URL = "https://vsaverapi.imcbs.com/api/debtors/"
+
+def _safe_paginate(url, timeout=10):
+    """
+    Helper: fetches a URL and returns (results_list, next_url).
+    Handles both plain list responses and paginated {"results":[], "next":...} responses.
+    """
+    resp = http_requests.get(url, timeout=timeout)
+    resp.raise_for_status()
+    data = resp.json()
+    if isinstance(data, list):
+        return data, None
+    return data.get("results", []), data.get("next")
+
+
+def _find_debtor_by_phone(phone_number):
+    url = DEBTORS_API_URL
+    while url:
+        try:
+            results, next_url = _safe_paginate(url, timeout=10)
+        except Exception as e:
+            raise Exception(f"Failed to reach debtors API: {e}")
+
+        for debtor in results:
+            phone2 = (debtor.get("phone2") or "").strip()
+            if phone2 and phone2[-10:] == phone_number:
+                return debtor
+
+        url = next_url
+
+    return None
+
+
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
 def user_login(request):
-    serializer = LoginSerializer(data=request.data)
-    if not serializer.is_valid():
-        return Response(serializer.errors, status=400)
+    phone_number = request.data.get("phone_number", "").strip().replace(" ", "")
 
-    user = serializer.validated_data["user"]
+    if not phone_number or not phone_number.lstrip("+").isdigit() or len(phone_number.lstrip("+")) < 10:
+        return Response({"error": "Please provide a valid 10-digit mobile number."}, status=400)
+
+    phone_number = phone_number[-10:]
+
+    try:
+        debtor = _find_debtor_by_phone(phone_number)
+    except Exception as e:
+        return Response({"error": str(e)}, status=503)
+
+    if not debtor:
+        return Response(
+            {"error": "Mobile number not registered. Please contact your admin."},
+            status=404
+        )
+
+    debtor_code = (debtor.get("code") or "").strip()
+    debtor_name = (debtor.get("name") or "").strip()
+
+    user, created = User.objects.get_or_create(
+        phone_number=phone_number,
+        defaults={
+            "username": f"debtor_{debtor_code}_{phone_number}",
+            "user_type": "user",
+            "status": "Active",
+            "business_name": debtor_name,
+            "location": debtor.get("place") or "",
+        }
+    )
 
     if _block_if_disabled(user):
-        return Response({"error": "Account is disabled"}, status=403)
-
-    if user.user_type != "user":
-        return Response({"error": "User login only"}, status=403)
+        return Response({"error": "Your account is disabled. Please contact admin."}, status=403)
 
     refresh = RefreshToken.for_user(user)
     return Response({
         "access": str(refresh.access_token),
         "refresh": str(refresh),
-        "user": UserPublicSerializer(user).data
+        "user": {
+            **UserPublicSerializer(user).data,
+            "debtor_code": debtor_code,
+            "debtor_name": debtor_name,
+            "place": debtor.get("place") or "",
+            "balance": debtor.get("exregnodate") or "0",
+        }
     })
 
 
@@ -318,8 +400,10 @@ class OfferMasterListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         """
-        Everyone sees ALL offers (created by admin)
+        Everyone sees ALL offers (created by admin).
+        Expired offers are auto-marked inactive before querying.
         """
+        auto_expire_offers()
         return OfferMaster.objects.all().prefetch_related('branches', 'media_files').order_by('-created_at')
 
     def get_serializer_class(self):
@@ -628,6 +712,9 @@ def get_branch_offers(request, branch_id):
     Only if the branch belongs to the logged-in user
     Returns branch info + its offers
     """
+    # Auto-expire any offers whose valid_to has passed
+    auto_expire_offers()
+
     user = request.user
     
     try:
@@ -738,6 +825,9 @@ def discover_offers(request):
         GET /api/public/offers/?branch_id=<uuid>
     """
     try:
+        # Auto-expire any offers whose valid_to has passed
+        auto_expire_offers()
+
         # Get query parameters for filtering
         location = request.query_params.get('location', None)
         city = request.query_params.get('city', None)
@@ -794,6 +884,9 @@ def get_all_active_branches_public(request):
         GET /api/public/branches/?city=Kochi
     """
     try:
+        # Auto-expire any offers whose valid_to has passed
+        auto_expire_offers()
+
         # Get query parameters for filtering
         location = request.query_params.get('location', None)
         city = request.query_params.get('city', None)
@@ -1235,6 +1328,9 @@ def public_branch_offers(request, branch_id):
     Called when customer scans the branch QR code.
     Returns branch info + all active offers for that branch.
     """
+    # Auto-expire any offers whose valid_to has passed
+    auto_expire_offers()
+
     try:
         branch = BranchMaster.objects.prefetch_related(
             'offers',
@@ -1246,3 +1342,108 @@ def public_branch_offers(request, branch_id):
 
     serializer = BranchWithOffersSerializer(branch, context={'request': request})
     return Response(serializer.data)
+
+# ===================== USER INVOICES (E-Invoice History) =====================
+
+INVOICES_API_URL = "https://vsaverapi.imcbs.com/api/invoices/"
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def user_invoices(request):
+    """
+    Returns invoices for the logged-in user by matching their debtor_code
+    (stored in username as debtor_<code>_<phone>) against customerid in
+    the external invoices API.
+
+    Handles both plain list [] and paginated {"results":[], "next":...} responses.
+
+    Query params:
+      ?debtor_code=<code>   — override auto-detected code (optional)
+      ?limit=<n>            — max invoices to return (default 20, max 50)
+    """
+    # ── 1. Resolve debtor_code from username ──────────────────────
+    debtor_code = request.query_params.get('debtor_code', '').strip()
+
+    if not debtor_code:
+        # Username pattern: debtor_<code>_<phone>  e.g. debtor_.,DBH_9656938213
+        username = getattr(request.user, 'username', '') or ''
+        if username.startswith('debtor_'):
+            inner = username[len('debtor_'):]
+            # phone is always the last segment after final underscore
+            parts = inner.rsplit('_', 1)
+            debtor_code = parts[0] if len(parts) == 2 else inner
+
+    if not debtor_code:
+        return Response(
+            {'error': 'Could not determine customer code for this account.'},
+            status=400
+        )
+
+    limit = min(int(request.query_params.get('limit', 20)), 50)
+
+    def _collect_invoices(base_url, max_pages=300):
+        """
+        Paginate through the invoices API (handles both list and dict responses)
+        and collect all invoices matching debtor_code.
+        """
+        collected = []
+        url = base_url
+        pages = 0
+
+        while url and pages < max_pages:
+            try:
+                results, next_url = _safe_paginate(url, timeout=15)
+            except Exception as e:
+                raise Exception(f"Invoice API error: {e}")
+
+            pages += 1
+            for inv in results:
+                if (inv.get('customerid') or '').strip() == debtor_code:
+                    collected.append({
+                        'slno':     inv.get('slno'),
+                        'invdate':  inv.get('invdate'),
+                        'nettotal': inv.get('nettotal'),
+                    })
+
+            url = next_url
+
+        return collected
+
+    # ── 2. Try filtered endpoint first (fast path) ───────────────
+    try:
+        filtered_url = f"{INVOICES_API_URL}?customerid={debtor_code}&page_size=100"
+        test_results, _ = _safe_paginate(filtered_url, timeout=15)
+
+        # Verify the API actually filtered (all results must match our code)
+        api_filtered = bool(test_results) and all(
+            (r.get('customerid') or '').strip() == debtor_code
+            for r in test_results
+        )
+
+        if api_filtered:
+            # API supports filtering — paginate only filtered results (fast)
+            collected = _collect_invoices(filtered_url, max_pages=50)
+        else:
+            # API ignores the filter — fall back to full scan
+            raise ValueError("API does not support customerid filter")
+
+    except Exception:
+        # ── 3. Full scan fallback ─────────────────────────────────
+        try:
+            collected = _collect_invoices(INVOICES_API_URL, max_pages=300)
+        except Exception as e:
+            return Response(
+                {'error': f'Failed to fetch invoices: {str(e)}'},
+                status=503
+            )
+
+    # ── 4. Sort descending by slno and return top N ───────────────
+    collected.sort(key=lambda x: x.get('slno') or 0, reverse=True)
+
+    return Response({
+        'success':     True,
+        'debtor_code': debtor_code,
+        'total_found': len(collected),
+        'invoices':    collected[:limit],
+    })

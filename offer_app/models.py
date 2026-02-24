@@ -17,7 +17,7 @@ class User(AbstractUser):
         ('Disable', 'Disable'),
     ]
     user_type = models.CharField(max_length=20, choices=USER_TYPE_CHOICES, default='user')
-    phone_number = models.CharField(max_length=15, blank=True, null=True, default='')
+    phone_number = models.CharField(max_length=15, blank=True, null=True, unique=True)
     business_name = models.CharField(max_length=255, blank=True, null=True, default='')
     shop_name = models.CharField(max_length=255, blank=True, null=True, default='')
     location = models.CharField(max_length=255, blank=True, null=True, default='')

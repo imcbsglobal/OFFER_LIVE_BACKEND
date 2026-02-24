@@ -59,6 +59,9 @@ urlpatterns = [
     # ---------- DASHBOARD STATS ----------
     path('dashboard/stats/', views.user_dashboard_stats, name='dashboard-stats'),
 
+    # ---------- USER INVOICES ----------
+    path('invoices/my/', views.user_invoices, name='user-invoices'),
+
     # ---------- ADMIN ----------
     path('admins/stats/', views.AdminStatsView.as_view(), name='admin-stats'),
     path('admins/', views.AdminListView.as_view(), name='admin-list'),
