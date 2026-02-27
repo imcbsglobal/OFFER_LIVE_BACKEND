@@ -44,6 +44,7 @@ class UserPublicSerializer(serializers.ModelSerializer):
             "validity_end",
             "created_date",
             "date_joined",
+            "client_id",
         )
 
 
@@ -95,11 +96,13 @@ class LoginSerializer(serializers.Serializer):
     email = serializers.EmailField(required=False, allow_blank=True)
     username = serializers.CharField(required=False, allow_blank=True)
     password = serializers.CharField()
+    client_id = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, data):
         email = (data.get("email") or "").strip()
         username = (data.get("username") or "").strip()
         password = data.get("password")
+        client_id = (data.get("client_id") or "").strip()
 
         if not password:
             raise serializers.ValidationError({"error": "Password is required."})
@@ -127,6 +130,7 @@ class LoginSerializer(serializers.Serializer):
             if user is None:
                 raise serializers.ValidationError({"error": "Invalid username or password."})
 
+        # client_id is handled in the view — not validated here
         data["user"] = user
         return data
 
@@ -378,12 +382,14 @@ class OfferMasterMediaSerializer(serializers.ModelSerializer):
 
 class OfferMasterSerializer(serializers.ModelSerializer):
     """
-    Serializer for reading/listing OfferMaster with all media files and branches
+    Serializer for reading/listing OfferMaster with all media files and branches.
+    computed_status reflects real-time status based on date + hourly window (IST).
     """
-    media_files = OfferMasterMediaSerializer(many=True, read_only=True)
-    media_count = serializers.SerializerMethodField()
-    branches = BranchMasterSerializer(many=True, read_only=True)
-    branch_count = serializers.SerializerMethodField()
+    media_files     = OfferMasterMediaSerializer(many=True, read_only=True)
+    media_count     = serializers.SerializerMethodField()
+    branches        = BranchMasterSerializer(many=True, read_only=True)
+    branch_count    = serializers.SerializerMethodField()
+    computed_status = serializers.SerializerMethodField()
 
     class Meta:
         model = OfferMaster
@@ -393,7 +399,10 @@ class OfferMasterSerializer(serializers.ModelSerializer):
             'description',
             'valid_from',
             'valid_to',
+            'offer_start_time',
+            'offer_end_time',
             'status',
+            'computed_status',
             'media_files',
             'media_count',
             'branches',
@@ -408,6 +417,36 @@ class OfferMasterSerializer(serializers.ModelSerializer):
 
     def get_branch_count(self, obj):
         return obj.branches.count()
+
+    def get_computed_status(self, obj):
+        """
+        Real-time status in IST:
+          inactive  -> admin manually disabled OR date fully passed
+          scheduled -> date not started yet, OR hourly window hasnt started today
+          active    -> within valid date AND within hourly window (if set)
+          expired   -> hourly window ended today (same-day offer whose window passed)
+        """
+        if obj.status == 'inactive':
+            return 'inactive'
+
+        now_ist  = timezone.localtime()
+        today    = now_ist.date()
+        now_time = now_ist.time().replace(second=0, microsecond=0)
+
+        if obj.valid_from > today:
+            return 'scheduled'
+        if obj.valid_to < today:
+            return 'inactive'
+
+        if obj.offer_start_time and obj.offer_end_time:
+            if now_time < obj.offer_start_time:
+                return 'scheduled'
+            elif now_time > obj.offer_end_time:
+                return 'expired'
+            else:
+                return 'active'
+
+        return 'active' 
 
 
 class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
@@ -440,6 +479,8 @@ class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
             'description',
             'valid_from',
             'valid_to',
+            'offer_start_time',
+            'offer_end_time',
             'status',
             'files',
             'captions',
@@ -450,8 +491,25 @@ class OfferMasterCreateUpdateSerializer(serializers.ModelSerializer):
         if data.get('valid_from') and data.get('valid_to'):
             if data['valid_to'] < data['valid_from']:
                 raise serializers.ValidationError({
-                    'valid_to': 'End date must be after start date.'
+                    'valid_to': 'End date must be on or after start date.'
                 })
+
+        # Hourly time validation
+        start_time = data.get('offer_start_time')
+        end_time   = data.get('offer_end_time')
+        if start_time and end_time:
+            if end_time <= start_time:
+                raise serializers.ValidationError({
+                    'offer_end_time': 'Offer end time must be after start time.'
+                })
+        elif start_time and not end_time:
+            raise serializers.ValidationError({
+                'offer_end_time': 'Please provide an end time when start time is set.'
+            })
+        elif end_time and not start_time:
+            raise serializers.ValidationError({
+                'offer_start_time': 'Please provide a start time when end time is set.'
+            })
 
         files = data.get('files', [])
         if files:
@@ -565,19 +623,48 @@ class BranchWithOffersSerializer(serializers.ModelSerializer):
         ]
 
     def get_active_offers(self, obj):
-        """Return only active, non-expired offers for this branch"""
-        today = timezone.localdate()
+        """
+        Return offers that are:
+          - Date-valid: valid_from <= today (IST) <= valid_to
+          - Not manually disabled: status != 'inactive'
+          - Within hourly window if set (compared in IST via Django TIME_ZONE setting)
+        """
+        now_ist  = timezone.localtime()          # IST because TIME_ZONE = 'Asia/Kolkata'
+        today    = now_ist.date()
+        now_time = now_ist.time().replace(second=0, microsecond=0)
+
         active_offers = obj.offers.filter(
-            valid_to__gte=today         # ✅ exclude expired offers by date
+            valid_from__lte=today,
+            valid_to__gte=today,
         ).exclude(status='inactive').prefetch_related('media_files')
-        return OfferMasterSerializer(active_offers, many=True, context=self.context).data
+
+        result = []
+        for offer in active_offers:
+            if offer.offer_start_time and offer.offer_end_time:
+                if not (offer.offer_start_time <= now_time <= offer.offer_end_time):
+                    continue
+            result.append(offer)
+
+        return OfferMasterSerializer(result, many=True, context=self.context).data
 
     def get_offers_count(self, obj):
-        """Return count of active, non-expired offers"""
-        today = timezone.localdate()
-        return obj.offers.filter(
-            valid_to__gte=today         # ✅ exclude expired offers by date
-        ).exclude(status='inactive').count()
+        """Return count of currently visible offers (date + IST hourly window)."""
+        now_ist  = timezone.localtime()
+        today    = now_ist.date()
+        now_time = now_ist.time().replace(second=0, microsecond=0)
+
+        offers = obj.offers.filter(
+            valid_from__lte=today,
+            valid_to__gte=today,
+        ).exclude(status='inactive')
+
+        count = 0
+        for offer in offers:
+            if offer.offer_start_time and offer.offer_end_time:
+                if not (offer.offer_start_time <= now_time <= offer.offer_end_time):
+                    continue
+            count += 1
+        return count
 
     def get_branch_image_url(self, obj):
         if obj.branch_image:

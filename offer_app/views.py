@@ -36,18 +36,52 @@ from .serializers import (
 
 def auto_expire_offers():
     """
-    Bulk-set status='inactive' for any OfferMaster whose valid_to date
-    has passed today. Called at the top of every view that reads offers,
-    so no cron job or Celery is needed — expiry is applied on the next
-    API hit after the date passes.
+    Auto-manages OfferMaster status based on date + hourly window (IST).
+    Called on every relevant API request — no cron needed.
+
+    Rules:
+      1. Date expired (valid_to < today)           → inactive
+      2. Date not started (valid_from > today)      → scheduled
+      3. Within date range, hourly window set:
+           before window start                      → scheduled
+           inside window                            → active
+           after window end                         → expired (stored as inactive)
+      4. Within date range, no hourly window        → active
     """
-    today = timezone.localdate()
-    expired_count = OfferMaster.objects.filter(
+    now_ist  = timezone.localtime()
+    today    = now_ist.date()
+    now_time = now_ist.time().replace(second=0, microsecond=0)
+
+    # ── 1. Expire: valid_to strictly before today ──────────────────────
+    OfferMaster.objects.filter(
         valid_to__lt=today,
-        status='active'          # only touch active ones, leave scheduled/inactive alone
-    ).update(status='inactive')
-    if expired_count:
-        print(f"[auto_expire] Marked {expired_count} offer(s) as inactive (valid_to passed).")
+    ).exclude(status='inactive').update(status='inactive')
+
+    # ── 2. Scheduled: valid_from in the future ─────────────────────────
+    OfferMaster.objects.filter(
+        valid_from__gt=today,
+    ).exclude(status='inactive').update(status='scheduled')
+
+    # ── 3 & 4. Offers within date range ───────────────────────────────
+    in_range = OfferMaster.objects.filter(
+        valid_from__lte=today,
+        valid_to__gte=today,
+    ).exclude(status='inactive')
+
+    for offer in in_range:
+        if offer.offer_start_time and offer.offer_end_time:
+            if now_time < offer.offer_start_time:
+                new_status = 'scheduled'
+            elif now_time > offer.offer_end_time:
+                new_status = 'inactive'   # window ended — mark inactive for today
+            else:
+                new_status = 'active'     # inside the window ✅
+        else:
+            new_status = 'active'         # no time window — active all day
+
+        if offer.status != new_status:
+            offer.status = new_status
+            offer.save(update_fields=['status'])
 
 # ------------------ PERMISSIONS ------------------
 
@@ -68,6 +102,19 @@ def _block_if_disabled(user):
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
 def admin_login(request):
+    client_id = (request.data.get("client_id") or "").strip()
+    if not client_id:
+        return Response({"error": "Client ID is required."}, status=400)
+
+    # ── Validate client_id exists in the live debtors API ─────────────────────
+    try:
+        client_exists = _validate_client_id(client_id)
+        if not client_exists:
+            return Response({"error": "Invalid Client ID. Please check and try again."}, status=400)
+    except Exception:
+        # If debtors API is unreachable, allow login (don't lock out admins)
+        pass
+
     serializer = LoginSerializer(data=request.data)
     if not serializer.is_valid():
         return Response(serializer.errors, status=400)
@@ -80,6 +127,10 @@ def admin_login(request):
     if user.user_type != "admin":
         return Response({"error": "Admin access only"}, status=403)
 
+    # Always update stored client_id — it changes over time in the external API
+    User.objects.filter(pk=user.pk).update(client_id=client_id)
+    user.client_id = client_id
+
     refresh = RefreshToken.for_user(user)
     return Response({
         "access": str(refresh.access_token),
@@ -91,6 +142,59 @@ def admin_login(request):
 # ─── Debtors API ──────────────────────────────────────────────────────────────
 
 DEBTORS_API_URL = "https://vsaverapi.imcbs.com/api/debtors/"
+
+def _validate_client_id(client_id):
+    """
+    Fetch ALL pages of the debtors API and check if client_id exists.
+    Handles both plain list and paginated {"results":[], "next":...} responses.
+    Also tries filtering directly by client_id as a query param for speed.
+    """
+    # First try: filter directly by client_id (fast, if API supports it)
+    try:
+        resp = http_requests.get(
+            DEBTORS_API_URL,
+            params={"client_id": client_id},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            records = data if isinstance(data, list) else data.get("results", [])
+            if any((r.get("client_id") or "").strip() == client_id for r in records):
+                return True
+    except Exception:
+        pass
+
+    # Second try: paginate through ALL records
+    url = DEBTORS_API_URL
+    page = 1
+    while url:
+        try:
+            resp = http_requests.get(url, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            raise Exception(f"Failed to reach debtors API: {e}")
+
+        if isinstance(data, list):
+            # Plain list — all records returned at once
+            records = data
+            next_url = None
+        else:
+            # Paginated response
+            records = data.get("results", [])
+            next_url = data.get("next")
+
+        for record in records:
+            if (record.get("client_id") or "").strip() == client_id:
+                return True
+
+        url = next_url
+        page += 1
+        if page > 50:  # safety limit — max 50 pages
+            break
+
+    return False
+
 
 def _safe_paginate(url, timeout=10):
     """
@@ -432,13 +536,19 @@ class OfferMasterListCreateView(generics.ListCreateAPIView):
             
             # Get other form data
             data = {
-                'title': request.data.get('title'),
+                'title':       request.data.get('title'),
                 'description': request.data.get('description', ''),
-                'valid_from': request.data.get('valid_from'),
-                'valid_to': request.data.get('valid_to'),
-                'status': request.data.get('status', 'active'),
+                'valid_from':  request.data.get('valid_from'),
+                'valid_to':    request.data.get('valid_to'),
+                'status':      request.data.get('status', 'active'),
             }
-            
+
+            # Hourly offer time window (optional — empty string means clear/null)
+            offer_start_time = request.data.get('offer_start_time', '')
+            offer_end_time   = request.data.get('offer_end_time', '')
+            data['offer_start_time'] = offer_start_time if offer_start_time else None
+            data['offer_end_time']   = offer_end_time   if offer_end_time   else None
+
             # Add files and branch_ids to data
             if files:
                 data['files'] = files
@@ -514,12 +624,20 @@ class OfferMasterDetailView(generics.RetrieveUpdateDestroyAPIView):
             
             # Get other form data
             data = {
-                'title': request.data.get('title', instance.title),
+                'title':       request.data.get('title',       instance.title),
                 'description': request.data.get('description', instance.description),
-                'valid_from': request.data.get('valid_from', instance.valid_from),
-                'valid_to': request.data.get('valid_to', instance.valid_to),
-                'status': request.data.get('status', instance.status),
+                'valid_from':  request.data.get('valid_from',  instance.valid_from),
+                'valid_to':    request.data.get('valid_to',    instance.valid_to),
+                'status':      request.data.get('status',      instance.status),
             }
+
+            # Hourly offer time window — empty string clears the time (sets to null)
+            if 'offer_start_time' in request.data:
+                val = request.data.get('offer_start_time', '')
+                data['offer_start_time'] = val if val else None
+            if 'offer_end_time' in request.data:
+                val = request.data.get('offer_end_time', '')
+                data['offer_end_time'] = val if val else None
             
             # Add files if provided
             if files:
@@ -833,10 +951,12 @@ def discover_offers(request):
         city = request.query_params.get('city', None)
         branch_id = request.query_params.get('branch_id', None)
         
-        # Start with all active offers
+        # Start with all offers that are date-valid and not manually disabled
+        today = timezone.localdate()
         offers = OfferMaster.objects.filter(
-            status='active'
-        ).prefetch_related('branches', 'branches__user', 'media_files')
+            valid_from__lte=today,
+            valid_to__gte=today,
+        ).exclude(status='inactive').prefetch_related('branches', 'branches__user', 'media_files')
         
         # Filter by branch if specified
         if branch_id:
@@ -1277,44 +1397,59 @@ def sync_misel_shops(request):
             status=status.HTTP_502_BAD_GATEWAY
         )
 
-    shops = data.get('results', [])
+    # ✅ FIX: Misel API returns a plain list [], not {"results": []}
+    # Calling .get() on a list raises AttributeError → 500. Handle both shapes.
+    shops = data if isinstance(data, list) else data.get('results', [])
     created = []
     skipped = []
+    no_client_id = []
 
     for shop in shops:
         firm_name = shop.get('firm_name', '').strip()
-        address = shop.get('address1', '').strip()
-        misel_id = shop.get('id')
+        address   = shop.get('address1',  '').strip()
+        misel_id  = shop.get('id')
+        client_id = (shop.get('client_id') or '').strip()
 
         if not firm_name:
             continue
 
-        # Generate a unique username from misel ID
-        base_username = f"misel_{misel_id}"
+        # ✅ client_id is the stable business key — use it when available.
+        # Fall back to misel_{id} only for shops not yet assigned a client_id.
+        # Once client_id is assigned upstream, re-running sync will create
+        # the correct misel_{client_id} user automatically.
+        if client_id:
+            base_username = f"misel_{client_id}"
+        else:
+            base_username = f"misel_{misel_id}"
+            no_client_id.append(firm_name)
 
         if User.objects.filter(username=base_username).exists():
-            skipped.append(firm_name)
+            skipped.append(base_username)
             continue
 
-        # Create a User record for this Misel shop
         User.objects.create_user(
             username=base_username,
             email=f"{base_username}@misel.sync",
             password=secrets.token_urlsafe(16),
             user_type='user',
             shop_name=firm_name,
+            business_name=client_id,  # store client_id here for easy lookup
             location=address,
             status='Active',
         )
-        created.append(firm_name)
+        created.append(base_username)
 
     return Response({
-        'success': True,
-        'created': created,
+        'success':       True,
+        'created':       created,
         'created_count': len(created),
-        'skipped': skipped,
+        'skipped':       skipped,
         'skipped_count': len(skipped),
-        'message': f'{len(created)} shop(s) synced, {len(skipped)} already existed.'
+        'no_client_id':  no_client_id,
+        'message': (
+            f'{len(created)} shop(s) synced, {len(skipped)} already existed'
+            + (f', {len(no_client_id)} missing client_id (used misel_id fallback).' if no_client_id else '.')
+        )
     }, status=status.HTTP_200_OK)
 
 

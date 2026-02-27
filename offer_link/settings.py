@@ -12,7 +12,7 @@ DEBUG = True
 ALLOWED_HOSTS = [
     "127.0.0.1",
     "localhost",
-    "192.168.1.45",  # ✅ Updated to correct local IP
+    "192.168.1.45",
 ]
 
 
@@ -95,9 +95,9 @@ AUTH_PASSWORD_VALIDATORS = [
 
 # Internationalization
 LANGUAGE_CODE = 'en-us'
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Kolkata'   # ✅ FIXED: was 'UTC' — caused hourly offer time mismatch
 USE_I18N = True
-USE_TZ = True
+USE_TZ = True                # ✅ Keep True — Django stores UTC in DB, converts to IST for display
 
 # Static files
 STATIC_URL = '/static/'
@@ -151,26 +151,26 @@ SIMPLE_JWT = {
     'USER_ID_CLAIM': 'user_id',
 }
 
-# ✅ CORS — single definition, correct IP, all needed origins
+# CORS
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
-    "http://192.168.1.45:5173",  # ✅ Local network frontend
-    "http://192.168.1.45:3000",  # ✅ Local network (if using port 3000)
+    "http://192.168.1.45:5173",
+    "http://192.168.1.45:3000",
 ]
 
-CORS_ALLOW_ALL_ORIGINS = True  # ✅ Keep True during development for ease
+CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
 
 # File upload settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
 
-# ✅ Site URLs — correct IP, correct ports
-SITE_URL = 'http://192.168.1.45:8000'    # Django backend — used for QR/API links
-FRONTEND_URL = 'http://192.168.1.45:5173'  # React frontend
+# Site URLs
+SITE_URL = 'http://192.168.1.45:8000'
+FRONTEND_URL = 'http://192.168.1.45:5173'
 
 # Logging configuration
 LOGGING = {

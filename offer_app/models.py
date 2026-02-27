@@ -27,6 +27,7 @@ class User(AbstractUser):
     no_days = models.IntegerField(default=0)
     validity_start = models.DateField(blank=True, null=True)
     validity_end = models.DateField(blank=True, null=True)
+    client_id = models.CharField(max_length=100, blank=True, null=True, default='')
     created_date = models.DateTimeField(auto_now_add=True)
 
     def save(self, *args, **kwargs):
@@ -256,6 +257,9 @@ class OfferMaster(models.Model):
     description = models.TextField(blank=True, null=True)
     valid_from = models.DateField()
     valid_to = models.DateField()
+    # Optional hourly window — if both are set the offer is only active between these times
+    offer_start_time = models.TimeField(blank=True, null=True, help_text="Daily start time for hourly offers (e.g. 15:00)")
+    offer_end_time   = models.TimeField(blank=True, null=True, help_text="Daily end time for hourly offers (e.g. 17:00)")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     
     # Many-to-Many relationship with BranchMaster
