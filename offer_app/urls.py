@@ -6,6 +6,8 @@ urlpatterns = [
     # ---------- AUTH ----------
     path('admin/login/', views.admin_login, name='admin-login'),
     path('user/login/', views.user_login, name='user-login'),
+    path('user/request-otp/', views.user_request_otp, name='user-request-otp'),
+    path('user/verify-otp/', views.user_verify_otp, name='user-verify-otp'),
     path('register/', views.register_user, name='register-user'),
 
     # ---------- CATEGORY ----------
@@ -66,4 +68,7 @@ urlpatterns = [
     path('admins/stats/', views.AdminStatsView.as_view(), name='admin-stats'),
     path('admins/', views.AdminListView.as_view(), name='admin-list'),
     path('admins/<int:pk>/', views.AdminDetailView.as_view(), name='admin-detail'),
+
+
+
 ]

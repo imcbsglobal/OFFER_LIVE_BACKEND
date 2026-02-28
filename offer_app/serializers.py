@@ -2,7 +2,7 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.utils import timezone
-from .models import User, Category, Product, Offer, OfferMaster, OfferMasterMedia, BranchMaster
+from .models import User, Category, Product, Offer, OfferMaster, OfferMasterMedia, BranchMaster, AccMaster, Misel, AccInvMast
 
 
 # ---------------- USER SERIALIZERS ----------------
@@ -679,3 +679,56 @@ class BranchWithOffersSerializer(serializers.ModelSerializer):
 
     def get_user_id(self, obj):
         return obj.user.id
+
+# ================================================================
+# ---------------- SYNC DATA SERIALIZERS ----------------
+# AccMaster, Misel, AccInvMast — read-only, admin use only.
+# client_id is stored as data but NOT used as a filter anywhere.
+# ================================================================
+
+class AccMasterSerializer(serializers.ModelSerializer):
+    """Customers / Debtors synced from the accounting system."""
+    class Meta:
+        model  = AccMaster
+        fields = [
+            'id',
+            'code',
+            'name',
+            'place',
+            'phone2',
+            'exregnodate',
+            'super_code',
+            'client_id',
+            'synced_at',
+        ]
+        read_only_fields = fields
+
+
+class MiselSerializer(serializers.ModelSerializer):
+    """Shop / firm records synced from the Misel system."""
+    class Meta:
+        model  = Misel
+        fields = [
+            'id',
+            'firm_name',
+            'address1',
+            'client_id',
+            'synced_at',
+        ]
+        read_only_fields = fields
+
+
+class AccInvMastSerializer(serializers.ModelSerializer):
+    """Invoice records synced from the accounting system."""
+    class Meta:
+        model  = AccInvMast
+        fields = [
+            'id',
+            'slno',
+            'invdate',
+            'customerid',
+            'nettotal',
+            'client_id',
+            'synced_at',
+        ]
+        read_only_fields = fields

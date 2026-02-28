@@ -5,15 +5,15 @@ from datetime import timedelta
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-your-secret-key-here-change-in-production'
+# ─── Security ─────────────────────────────────────────────────────────────────
+SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-your-secret-key-here-change-in-production')
 
-DEBUG = True
+DEBUG = os.environ.get('DEBUG', 'True') == 'True'
 
-ALLOWED_HOSTS = [
-    "127.0.0.1",
-    "localhost",
-    "192.168.1.45",
-]
+ALLOWED_HOSTS = os.environ.get(
+    'ALLOWED_HOSTS',
+    '127.0.0.1,localhost,192.168.1.45'
+).split(',')
 
 
 # Application definition
@@ -65,15 +65,15 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'offer_link.wsgi.application'
 
-# Database
+# ─── Database ─────────────────────────────────────────────────────────────────
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql',
-        'NAME': 'offer_live',
-        'USER': 'postgres',
-        'PASSWORD': '12345',
-        'HOST': 'localhost',
-        'PORT': '5432',
+        'ENGINE'  : 'django.db.backends.postgresql',
+        'NAME'    : 'vsaver_db',
+        'USER'    : 'postgres',
+        'PASSWORD': 'info@imc',
+        'HOST'    : '88.222.212.14',
+        'PORT'    : '5432',
     }
 }
 
@@ -151,28 +151,36 @@ SIMPLE_JWT = {
     'USER_ID_CLAIM': 'user_id',
 }
 
-# CORS
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://192.168.1.45:5173",
-    "http://192.168.1.45:3000",
-]
+# ─── CORS ─────────────────────────────────────────────────────────────────────
+CORS_ALLOWED_ORIGINS = os.environ.get(
+    'CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173,http://192.168.1.45:5173,http://192.168.1.45:3000'
+).split(',')
 
-CORS_ALLOW_ALL_ORIGINS = True
+CORS_ALLOW_ALL_ORIGINS = os.environ.get('CORS_ALLOW_ALL_ORIGINS', 'True') == 'True'
 CORS_ALLOW_CREDENTIALS = True
 
-# File upload settings
+# ─── File upload settings ─────────────────────────────────────────────────────
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024   # 10MB
 
-# Site URLs
-SITE_URL = 'http://192.168.1.45:8000'
-FRONTEND_URL = 'http://192.168.1.45:5173'
+# ─── Site URLs ────────────────────────────────────────────────────────────────
+SITE_URL     = os.environ.get('SITE_URL',     'http://192.168.1.45:8000')
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'http://192.168.1.45:5173')
 
-# Logging configuration
+# ─── Cache (used for WhatsApp OTP storage) ───────────────────────────────────
+# Uses local memory by default — works for single server deployments.
+# Switch to Redis in .env if you scale to multiple servers:
+#   CACHE_BACKEND=django.core.cache.backends.redis.RedisCache
+#   CACHE_LOCATION=redis://127.0.0.1:6379/1
+CACHES = {
+    'default': {
+        'BACKEND':  os.environ.get('CACHE_BACKEND',  'django.core.cache.backends.locmem.LocMemCache'),
+        'LOCATION': os.environ.get('CACHE_LOCATION', 'unique-snowflake-otp'),
+    }
+}
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
 LOGGING = {
     'version': 1,
     'disable_existing_loggers': False,

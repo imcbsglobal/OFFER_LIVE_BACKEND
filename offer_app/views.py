@@ -8,9 +8,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.db.models import Q
 from django.utils import timezone
 import secrets
+import random
+import string
 import requests as http_requests
+from django.core.cache import cache
 
 from .models import User, Category, Product, Offer, OfferMaster, OfferMasterMedia, BranchMaster
+from .models import AccMaster, Misel, AccInvMast   # ✅ Sync models
 from .serializers import (
     UserSerializer,
     UserPublicSerializer,
@@ -30,39 +34,21 @@ from .serializers import (
     BranchMasterCreateUpdateSerializer,
     UserSimpleSerializer,
     BranchWithOffersSerializer,
+    AccMasterSerializer,
+    MiselSerializer,
+    AccInvMastSerializer,
 )
 
 # ------------------ AUTO-EXPIRE OFFERS ------------------
 
 def auto_expire_offers():
-    """
-    Auto-manages OfferMaster status based on date + hourly window (IST).
-    Called on every relevant API request — no cron needed.
-
-    Rules:
-      1. Date expired (valid_to < today)           → inactive
-      2. Date not started (valid_from > today)      → scheduled
-      3. Within date range, hourly window set:
-           before window start                      → scheduled
-           inside window                            → active
-           after window end                         → expired (stored as inactive)
-      4. Within date range, no hourly window        → active
-    """
     now_ist  = timezone.localtime()
     today    = now_ist.date()
     now_time = now_ist.time().replace(second=0, microsecond=0)
 
-    # ── 1. Expire: valid_to strictly before today ──────────────────────
-    OfferMaster.objects.filter(
-        valid_to__lt=today,
-    ).exclude(status='inactive').update(status='inactive')
+    OfferMaster.objects.filter(valid_to__lt=today).exclude(status='inactive').update(status='inactive')
+    OfferMaster.objects.filter(valid_from__gt=today).exclude(status='inactive').update(status='scheduled')
 
-    # ── 2. Scheduled: valid_from in the future ─────────────────────────
-    OfferMaster.objects.filter(
-        valid_from__gt=today,
-    ).exclude(status='inactive').update(status='scheduled')
-
-    # ── 3 & 4. Offers within date range ───────────────────────────────
     in_range = OfferMaster.objects.filter(
         valid_from__lte=today,
         valid_to__gte=today,
@@ -73,15 +59,16 @@ def auto_expire_offers():
             if now_time < offer.offer_start_time:
                 new_status = 'scheduled'
             elif now_time > offer.offer_end_time:
-                new_status = 'inactive'   # window ended — mark inactive for today
+                new_status = 'inactive'
             else:
-                new_status = 'active'     # inside the window ✅
+                new_status = 'active'
         else:
-            new_status = 'active'         # no time window — active all day
+            new_status = 'active'
 
         if offer.status != new_status:
             offer.status = new_status
             offer.save(update_fields=['status'])
+
 
 # ------------------ PERMISSIONS ------------------
 
@@ -91,7 +78,6 @@ class IsAdminUser(permissions.BasePermission):
 
 
 def _block_if_disabled(user):
-    # model uses: 'Active' / 'Disable'
     if getattr(user, "status", "Active") == "Disable":
         return True
     return False
@@ -106,14 +92,10 @@ def admin_login(request):
     if not client_id:
         return Response({"error": "Client ID is required."}, status=400)
 
-    # ── Validate client_id exists in the live debtors API ─────────────────────
-    try:
-        client_exists = _validate_client_id(client_id)
-        if not client_exists:
-            return Response({"error": "Invalid Client ID. Please check and try again."}, status=400)
-    except Exception:
-        # If debtors API is unreachable, allow login (don't lock out admins)
-        pass
+    # ✅ Validate client_id against AccMaster (single DB)
+    client_exists = AccMaster.objects.filter(client_id=client_id).exists()
+    if not client_exists:
+        return Response({"error": "Invalid Client ID. Please check and try again."}, status=400)
 
     serializer = LoginSerializer(data=request.data)
     if not serializer.is_valid():
@@ -127,103 +109,36 @@ def admin_login(request):
     if user.user_type != "admin":
         return Response({"error": "Admin access only"}, status=403)
 
-    # Always update stored client_id — it changes over time in the external API
     User.objects.filter(pk=user.pk).update(client_id=client_id)
     user.client_id = client_id
 
     refresh = RefreshToken.for_user(user)
     return Response({
-        "access": str(refresh.access_token),
+        "access":  str(refresh.access_token),
         "refresh": str(refresh),
-        "user": UserPublicSerializer(user).data
+        "user":    UserPublicSerializer(user).data
     })
 
 
-# ─── Debtors API ──────────────────────────────────────────────────────────────
-
-DEBTORS_API_URL = "https://vsaverapi.imcbs.com/api/debtors/"
-
-def _validate_client_id(client_id):
-    """
-    Fetch ALL pages of the debtors API and check if client_id exists.
-    Handles both plain list and paginated {"results":[], "next":...} responses.
-    Also tries filtering directly by client_id as a query param for speed.
-    """
-    # First try: filter directly by client_id (fast, if API supports it)
-    try:
-        resp = http_requests.get(
-            DEBTORS_API_URL,
-            params={"client_id": client_id},
-            timeout=10
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            records = data if isinstance(data, list) else data.get("results", [])
-            if any((r.get("client_id") or "").strip() == client_id for r in records):
-                return True
-    except Exception:
-        pass
-
-    # Second try: paginate through ALL records
-    url = DEBTORS_API_URL
-    page = 1
-    while url:
-        try:
-            resp = http_requests.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            raise Exception(f"Failed to reach debtors API: {e}")
-
-        if isinstance(data, list):
-            # Plain list — all records returned at once
-            records = data
-            next_url = None
-        else:
-            # Paginated response
-            records = data.get("results", [])
-            next_url = data.get("next")
-
-        for record in records:
-            if (record.get("client_id") or "").strip() == client_id:
-                return True
-
-        url = next_url
-        page += 1
-        if page > 50:  # safety limit — max 50 pages
-            break
-
-    return False
-
-
-def _safe_paginate(url, timeout=10):
-    """
-    Helper: fetches a URL and returns (results_list, next_url).
-    Handles both plain list responses and paginated {"results":[], "next":...} responses.
-    """
-    resp = http_requests.get(url, timeout=timeout)
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, list):
-        return data, None
-    return data.get("results", []), data.get("next")
+# ─── WhatsApp OTP (AiSensy) ───────────────────────────────────────────────────
+AISENSY_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY4NTI4ZmIxYjk4ZTc1NzI2ZTYxZjY2ZCIsIm5hbWUiOiJ2Y2FyZW1hcnQiLCJhcHBOYW1lIjoiQWlTZW5zeSIsImNsaWVudElkIjoiNjg1MjhmYjFiOThlNzU3MjZlNjFmNjVmIiwiYWN0aXZlUGxhbiI6Ik5PTkUiLCJpYXQiOjE3NTAyNDEyMDF9.XK_zrkUHTI1-Rlvjsue1QGacohAnqnos6h97z6QCb_A"
+AISENSY_URL     = "https://backend.api-wa.co/campaign/chatico/api/v2"
 
 
 def _find_debtor_by_phone(phone_number):
-    url = DEBTORS_API_URL
-    while url:
-        try:
-            results, next_url = _safe_paginate(url, timeout=10)
-        except Exception as e:
-            raise Exception(f"Failed to reach debtors API: {e}")
-
-        for debtor in results:
-            phone2 = (debtor.get("phone2") or "").strip()
-            if phone2 and phone2[-10:] == phone_number:
-                return debtor
-
-        url = next_url
-
+    """
+    Look up debtor by phone from AccMaster (single DB).
+    """
+    record = AccMaster.objects.filter(phone2__endswith=phone_number).first()
+    if record:
+        return {
+            "code":       record.code,
+            "name":       record.name,
+            "place":      record.place or "",
+            "phone2":     record.phone2 or "",
+            "exregnodate": record.exregnodate or "0",
+            "client_id":  record.client_id,
+        }
     return None
 
 
@@ -237,10 +152,7 @@ def user_login(request):
 
     phone_number = phone_number[-10:]
 
-    try:
-        debtor = _find_debtor_by_phone(phone_number)
-    except Exception as e:
-        return Response({"error": str(e)}, status=503)
+    debtor = _find_debtor_by_phone(phone_number)
 
     if not debtor:
         return Response(
@@ -254,11 +166,11 @@ def user_login(request):
     user, created = User.objects.get_or_create(
         phone_number=phone_number,
         defaults={
-            "username": f"debtor_{debtor_code}_{phone_number}",
-            "user_type": "user",
-            "status": "Active",
+            "username":      f"debtor_{debtor_code}_{phone_number}",
+            "user_type":     "user",
+            "status":        "Active",
             "business_name": debtor_name,
-            "location": debtor.get("place") or "",
+            "location":      debtor.get("place") or "",
         }
     )
 
@@ -267,14 +179,187 @@ def user_login(request):
 
     refresh = RefreshToken.for_user(user)
     return Response({
-        "access": str(refresh.access_token),
+        "access":  str(refresh.access_token),
         "refresh": str(refresh),
         "user": {
             **UserPublicSerializer(user).data,
             "debtor_code": debtor_code,
             "debtor_name": debtor_name,
-            "place": debtor.get("place") or "",
-            "balance": debtor.get("exregnodate") or "0",
+            "place":       debtor.get("place") or "",
+            "balance":     debtor.get("exregnodate") or "0",
+        }
+    })
+
+
+# ─── Helper: Send OTP via WhatsApp (AiSensy) ─────────────────────────────────
+
+def _send_whatsapp_otp(phone_number: str, otp: str, name: str = "user") -> tuple:
+    payload = {
+        "apiKey":         AISENSY_API_KEY,
+        "campaignName":   "app notif",
+        "destination":    f"91{phone_number}",
+        "userName":       "vcaremart",
+        "templateParams": [name],
+        "source":         "otp-login",
+        "media":          {},
+        "buttons": [
+            {
+                "type":     "button",
+                "sub_type": "url",
+                "index":    0,
+                "parameters": [{"type": "text", "text": otp}]
+            }
+        ],
+        "carouselCards": [],
+        "location":      {},
+        "attributes":    {},
+        "paramsFallbackValue": {"FirstName": name}
+    }
+    try:
+        res = http_requests.post(AISENSY_URL, json=payload, timeout=10)
+        print(f"[AiSensy] status={res.status_code} | phone=91{phone_number} | response={res.text}")
+        if res.status_code == 200:
+            return True, ""
+        try:
+            err_data = res.json()
+            err_msg  = err_data.get("message") or err_data.get("error") or res.text
+        except Exception:
+            err_msg = res.text or f"HTTP {res.status_code}"
+        return False, err_msg
+    except Exception as e:
+        print(f"[AiSensy] Exception: {e}")
+        return False, str(e)
+
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def user_request_otp(request):
+    """
+    STEP 1 — Request OTP
+    POST { phone_number: "9XXXXXXXXX" }
+    Checks AccMaster (default DB) first, then local DB
+    """
+    phone_number = request.data.get("phone_number", "").strip().replace(" ", "")
+
+    if not phone_number or not phone_number.lstrip("+").isdigit() or len(phone_number.lstrip("+")) < 10:
+        return Response({"error": "Please provide a valid 10-digit mobile number."}, status=400)
+
+    phone_number = phone_number[-10:]
+
+    name = "user"
+    local_user = User.objects.filter(phone_number=phone_number).first()
+
+    if local_user:
+        name = (local_user.business_name or local_user.username or "user").split()[0]
+    else:
+        # Check AccMaster (default DB)
+        debtor = _find_debtor_by_phone(phone_number)
+        if not debtor:
+            return Response(
+                {"error": "Mobile number not registered. Please contact your admin."},
+                status=404
+            )
+        name = (debtor.get("name") or "user").split()[0]
+
+    otp = "".join(random.choices(string.digits, k=6))
+    cache.set(f"otp_{phone_number}", otp, timeout=300)
+
+    print(f"[OTP] Generated OTP {otp} for {phone_number}")
+
+    sent, err_msg = _send_whatsapp_otp(phone_number, otp, name)
+
+    if not sent:
+        # ✅ Don't delete OTP from cache — user can still enter it manually
+        # OTP is visible in the terminal: [OTP] Generated OTP xxxxxx for xxxxxxxxxx
+        print(f"[OTP] AiSensy send failed for {phone_number}: {err_msg}")
+        return Response({
+            "message":      f"OTP generated for number ending in {phone_number[-4:]}. Check terminal.",
+            "phone_number": phone_number,
+            # ── REMOVE the line below in production once AiSensy is working ──
+            "dev_otp":      otp,
+        })
+
+    return Response({
+        "message":      f"OTP sent to WhatsApp number ending in {phone_number[-4:]}",
+        "phone_number": phone_number,
+    })
+
+
+@api_view(["POST"])
+@permission_classes([permissions.AllowAny])
+def user_verify_otp(request):
+    """
+    STEP 2 — Verify OTP → Login
+    POST { phone_number: "9XXXXXXXXX", otp: "123456" }
+    Creates user from AccMaster data (default DB) if not already in local DB
+    """
+    phone_number = request.data.get("phone_number", "").strip().replace(" ", "")
+    otp_input    = request.data.get("otp", "").strip()
+
+    if not phone_number or not otp_input:
+        return Response({"error": "Phone number and OTP are required."}, status=400)
+
+    phone_number = phone_number[-10:]
+    cache_key    = f"otp_{phone_number}"
+    cached_otp   = cache.get(cache_key)
+
+    if not cached_otp:
+        return Response({"error": "OTP expired or not requested. Please request a new OTP."}, status=400)
+
+    if otp_input != cached_otp:
+        return Response({"error": "Invalid OTP. Please try again."}, status=400)
+
+    cache.delete(cache_key)
+
+    debtor_code = ""
+    debtor_name = ""
+    place       = ""
+
+    local_user = User.objects.filter(phone_number=phone_number).first()
+
+    if local_user:
+        user        = local_user
+        debtor_name = local_user.business_name or ""
+        # Enrich from AccMaster (default DB)
+        debtor = _find_debtor_by_phone(phone_number)
+        if debtor:
+            debtor_code = (debtor.get("code") or "").strip()
+            debtor_name = (debtor.get("name") or debtor_name).strip()
+            place       = (debtor.get("place") or "").strip()
+    else:
+        # Must find in AccMaster to create user
+        debtor = _find_debtor_by_phone(phone_number)
+
+        if not debtor:
+            return Response({"error": "Mobile number not registered."}, status=404)
+
+        debtor_code = (debtor.get("code") or "").strip()
+        debtor_name = (debtor.get("name") or "").strip()
+        place       = (debtor.get("place") or "").strip()
+
+        user, _ = User.objects.get_or_create(
+            phone_number=phone_number,
+            defaults={
+                "username":      f"debtor_{debtor_code}_{phone_number}",
+                "user_type":     "user",
+                "status":        "Active",
+                "business_name": debtor_name,
+                "location":      place,
+            }
+        )
+
+    if _block_if_disabled(user):
+        return Response({"error": "Your account is disabled. Please contact admin."}, status=403)
+
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        "access":  str(refresh.access_token),
+        "refresh": str(refresh),
+        "user": {
+            **UserPublicSerializer(user).data,
+            "debtor_code": debtor_code,
+            "debtor_name": debtor_name,
+            "place":       place,
         }
     })
 
@@ -289,18 +374,18 @@ def register_user(request):
     user = serializer.save(user_type="user")
     refresh = RefreshToken.for_user(user)
     return Response({
-        "access": str(refresh.access_token),
+        "access":  str(refresh.access_token),
         "refresh": str(refresh),
-        "user": UserPublicSerializer(user).data
+        "user":    UserPublicSerializer(user).data
     }, status=201)
 
 
 # ===================== CATEGORY =====================
 
 class CategoryListCreateView(generics.ListCreateAPIView):
-    serializer_class = CategorySerializer
+    serializer_class   = CategorySerializer
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes     = [MultiPartParser, FormParser]
 
     def get_queryset(self):
         return Category.objects.all().order_by("-id")
@@ -310,10 +395,10 @@ class CategoryListCreateView(generics.ListCreateAPIView):
 
 
 class CategoryDetailView(generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = CategorySerializer
+    serializer_class   = CategorySerializer
     permission_classes = [permissions.IsAuthenticated]
-    queryset = Category.objects.all()
-    parser_classes = [MultiPartParser, FormParser]
+    queryset           = Category.objects.all()
+    parser_classes     = [MultiPartParser, FormParser]
 
     def destroy(self, request, *args, **kwargs):
         try:
@@ -344,7 +429,7 @@ def update_category_image(request, category_id):
 
 class ProductListCreateView(generics.ListCreateAPIView):
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes     = [MultiPartParser, FormParser]
 
     def get_serializer_class(self):
         return ProductCreateSerializer if self.request.method == "POST" else ProductSerializer
@@ -357,99 +442,52 @@ class ProductListCreateView(generics.ListCreateAPIView):
 
 
 class ProductDetailView(generics.RetrieveUpdateDestroyAPIView):
-    serializer_class = ProductSerializer
+    serializer_class   = ProductSerializer
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes     = [MultiPartParser, FormParser]
 
     def get_queryset(self):
         return Product.objects.filter(user=self.request.user)
 
     def update(self, request, *args, **kwargs):
-        """
-        Custom update method that excludes category and valid_until from being updated
-        """
         try:
             instance = self.get_object()
-            
-            # Create a mutable copy of request data
             data = request.data.copy()
-            
-            # Remove category and valid_until if present (these cannot be edited)
             data.pop('category', None)
             data.pop('valid_until', None)
-            
-            # Use ProductCreateSerializer for the update (handles file uploads properly)
             serializer = ProductCreateSerializer(instance, data=data, partial=True)
-            
             if serializer.is_valid():
                 serializer.save()
-                # Return full product data
                 return Response(ProductSerializer(instance).data)
-            
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-            
         except Product.DoesNotExist:
-            return Response(
-                {"error": "Product not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Product not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            print(f"Error updating product: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {"error": f"Failed to update product: {str(e)}"}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            import traceback; traceback.print_exc()
+            return Response({"error": f"Failed to update product: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def destroy(self, request, *args, **kwargs):
-        """
-        Custom destroy method to handle ManyToMany relationships before deletion
-        """
         try:
             instance = self.get_object()
-            
-            # Try to remove product from all offers if the relationship exists
             try:
                 if hasattr(instance, 'offers'):
                     instance.offers.clear()
             except Exception as clear_error:
-                # If offers relationship doesn't exist or fails, log but continue
                 print(f"Warning: Could not clear offers relationship: {str(clear_error)}")
-                # This is expected if migrations haven't been run yet
-            
-            # Now delete the product
             instance.delete()
-            
-            return Response(
-                {"message": "Product deleted successfully"}, 
-                status=status.HTTP_200_OK
-            )
+            return Response({"message": "Product deleted successfully"}, status=status.HTTP_200_OK)
         except Product.DoesNotExist:
-            return Response(
-                {"error": "Product not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Product not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            # Log the actual error for debugging
-            print(f"Error deleting product: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {"error": f"Failed to delete product: {str(e)}"}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            import traceback; traceback.print_exc()
+            return Response({"error": f"Failed to delete product: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
-# ===================== PRODUCTS BY CATEGORY =====================
 
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated])
 def products_by_category(request, category_name):
     products = Product.objects.filter(
-        user=request.user,
-        category=category_name,
-        is_active=True
+        user=request.user, category=category_name, is_active=True
     ).order_by("-created_at")
     return Response(ProductSerializer(products, many=True).data)
 
@@ -460,7 +498,7 @@ def products_by_category(request, category_name):
 @permission_classes([permissions.AllowAny])
 def get_offer(request, product_id):
     try:
-        product = Product.objects.get(id=product_id, is_active=True)
+        product    = Product.objects.get(id=product_id, is_active=True)
         serializer = OfferTemplateSerializer(product)
         return Response(serializer.data)
     except Product.DoesNotExist:
@@ -476,7 +514,7 @@ class OfferCreateView(APIView):
         serializer = OfferCreateSerializer(data=request.data, context={"request": request})
         if serializer.is_valid():
             offer = serializer.save()
-            out = OfferPublicSerializer(offer, context={"request": request})
+            out   = OfferPublicSerializer(offer, context={"request": request})
             return Response(out.data, status=201)
         return Response(serializer.errors, status=400)
 
@@ -485,28 +523,20 @@ class OfferCreateView(APIView):
 @permission_classes([permissions.AllowAny])
 def public_offer_detail(request, offer_id):
     try:
-        offer = Offer.objects.get(id=offer_id, is_public=True)
+        offer      = Offer.objects.get(id=offer_id, is_public=True)
         serializer = OfferPublicSerializer(offer)
         return Response(serializer.data)
     except Offer.DoesNotExist:
         return Response({"error": "Offer not found"}, status=404)
 
 
-# ===================== OFFER MASTER (UPDATED WITH BRANCH ASSIGNMENT) =====================
+# ===================== OFFER MASTER =====================
 
 class OfferMasterListCreateView(generics.ListCreateAPIView):
-    """
-    GET: List all offer masters (admins see all, users see all)
-    POST: Create a new offer master (ADMIN ONLY) with branch assignment
-    """
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes     = [MultiPartParser, FormParser]
 
     def get_queryset(self):
-        """
-        Everyone sees ALL offers (created by admin).
-        Expired offers are auto-marked inactive before querying.
-        """
         auto_expire_offers()
         return OfferMaster.objects.all().prefetch_related('branches', 'media_files').order_by('-created_at')
 
@@ -516,25 +546,11 @@ class OfferMasterListCreateView(generics.ListCreateAPIView):
         return OfferMasterSerializer
 
     def create(self, request, *args, **kwargs):
-        """
-        Custom create to handle multiple file uploads and branch assignment
-        ADMIN ONLY - Regular users cannot create offers
-        """
-        # CHECK: Only admin can create
         if request.user.user_type != 'admin':
-            return Response(
-                {"error": "Only administrators can create offers"}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({"error": "Only administrators can create offers"}, status=status.HTTP_403_FORBIDDEN)
         try:
-            # Get files using getlist - Django sends multiple files with same key
-            files = request.FILES.getlist('files')
-            
-            # Get branch IDs - Django sends multiple values with same key
+            files      = request.FILES.getlist('files')
             branch_ids = request.data.getlist('branch_ids')
-            
-            # Get other form data
             data = {
                 'title':       request.data.get('title'),
                 'description': request.data.get('description', ''),
@@ -542,40 +558,20 @@ class OfferMasterListCreateView(generics.ListCreateAPIView):
                 'valid_to':    request.data.get('valid_to'),
                 'status':      request.data.get('status', 'active'),
             }
-
-            # Hourly offer time window (optional — empty string means clear/null)
             offer_start_time = request.data.get('offer_start_time', '')
             offer_end_time   = request.data.get('offer_end_time', '')
             data['offer_start_time'] = offer_start_time if offer_start_time else None
             data['offer_end_time']   = offer_end_time   if offer_end_time   else None
-
-            # Add files and branch_ids to data
-            if files:
-                data['files'] = files
-            if branch_ids:
-                data['branch_ids'] = branch_ids
-            
+            if files:      data['files']      = files
+            if branch_ids: data['branch_ids'] = branch_ids
             serializer = self.get_serializer(data=data)
             serializer.is_valid(raise_exception=True)
-            
-            # Save with user (admin user)
             offer_master = serializer.save(user=request.user)
-            
-            # Return the created object with media files and branches
-            response_serializer = OfferMasterSerializer(
-                offer_master, 
-                context={'request': request}
-            )
+            response_serializer = OfferMasterSerializer(offer_master, context={'request': request})
             return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-            
         except Exception as e:
-            print(f"Error creating offer master: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {"error": f"Failed to create offer: {str(e)}"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            import traceback; traceback.print_exc()
+            return Response({"error": f"Failed to create offer: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -584,16 +580,10 @@ class OfferMasterListCreateView(generics.ListCreateAPIView):
 
 
 class OfferMasterDetailView(generics.RetrieveUpdateDestroyAPIView):
-    """
-    GET: Retrieve a specific offer master (everyone can view)
-    PUT/PATCH: Update an offer master (ADMIN ONLY) including branch assignment
-    DELETE: Delete an offer master (ADMIN ONLY)
-    """
     permission_classes = [permissions.IsAuthenticated]
-    parser_classes = [MultiPartParser, FormParser]
+    parser_classes     = [MultiPartParser, FormParser]
 
     def get_queryset(self):
-        """Everyone can view all offers"""
         return OfferMaster.objects.all().prefetch_related('branches', 'media_files')
 
     def get_serializer_class(self):
@@ -602,27 +592,12 @@ class OfferMasterDetailView(generics.RetrieveUpdateDestroyAPIView):
         return OfferMasterSerializer
 
     def update(self, request, *args, **kwargs):
-        """
-        Custom update to handle multiple file uploads and branch assignment
-        ADMIN ONLY - Regular users cannot edit offers
-        """
-        # CHECK: Only admin can update
         if request.user.user_type != 'admin':
-            return Response(
-                {"error": "Only administrators can update offers"}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({"error": "Only administrators can update offers"}, status=status.HTTP_403_FORBIDDEN)
         try:
-            instance = self.get_object()
-            
-            # Get files using getlist
-            files = request.FILES.getlist('files')
-            
-            # Get branch IDs
+            instance   = self.get_object()
+            files      = request.FILES.getlist('files')
             branch_ids = request.data.getlist('branch_ids')
-            
-            # Get other form data
             data = {
                 'title':       request.data.get('title',       instance.title),
                 'description': request.data.get('description', instance.description),
@@ -630,47 +605,24 @@ class OfferMasterDetailView(generics.RetrieveUpdateDestroyAPIView):
                 'valid_to':    request.data.get('valid_to',    instance.valid_to),
                 'status':      request.data.get('status',      instance.status),
             }
-
-            # Hourly offer time window — empty string clears the time (sets to null)
             if 'offer_start_time' in request.data:
                 val = request.data.get('offer_start_time', '')
                 data['offer_start_time'] = val if val else None
             if 'offer_end_time' in request.data:
                 val = request.data.get('offer_end_time', '')
                 data['offer_end_time'] = val if val else None
-            
-            # Add files if provided
-            if files:
-                data['files'] = files
-                
-            # Add branch_ids if provided (even if empty list, to allow clearing)
-            if branch_ids is not None:
-                data['branch_ids'] = branch_ids
-            
+            if files:                  data['files']      = files
+            if branch_ids is not None: data['branch_ids'] = branch_ids
             serializer = self.get_serializer(instance, data=data, partial=True)
             serializer.is_valid(raise_exception=True)
             serializer.save()
-            
-            # Return updated object with media files and branches
-            response_serializer = OfferMasterSerializer(
-                instance, 
-                context={'request': request}
-            )
+            response_serializer = OfferMasterSerializer(instance, context={'request': request})
             return Response(response_serializer.data)
-            
         except OfferMaster.DoesNotExist:
-            return Response(
-                {"error": "Offer not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Offer not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            print(f"Error updating offer master: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {"error": f"Failed to update offer: {str(e)}"}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            import traceback; traceback.print_exc()
+            return Response({"error": f"Failed to update offer: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -678,110 +630,52 @@ class OfferMasterDetailView(generics.RetrieveUpdateDestroyAPIView):
         return context
 
     def destroy(self, request, *args, **kwargs):
-        """
-        Delete an offer master and all its media files
-        ADMIN ONLY - Regular users cannot delete offers
-        """
-        # CHECK: Only admin can delete
         if request.user.user_type != 'admin':
-            return Response(
-                {"error": "Only administrators can delete offers"}, 
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
+            return Response({"error": "Only administrators can delete offers"}, status=status.HTTP_403_FORBIDDEN)
         try:
             instance = self.get_object()
-            # Media files will be automatically deleted via CASCADE
-            # Branch relationships will be automatically cleared
             instance.delete()
-            return Response(
-                {"message": "Offer deleted successfully"}, 
-                status=status.HTTP_200_OK
-            )
+            return Response({"message": "Offer deleted successfully"}, status=status.HTTP_200_OK)
         except OfferMaster.DoesNotExist:
-            return Response(
-                {"error": "Offer not found"}, 
-                status=status.HTTP_404_NOT_FOUND
-            )
+            return Response({"error": "Offer not found"}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
-            print(f"Error deleting offer: {str(e)}")
-            import traceback
-            traceback.print_exc()
-            return Response(
-                {"error": f"Failed to delete offer: {str(e)}"}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            import traceback; traceback.print_exc()
+            return Response({"error": f"Failed to delete offer: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-# ===================== OFFER MASTER MEDIA MANAGEMENT =====================
+# ===================== OFFER MASTER MEDIA =====================
 
 @api_view(['DELETE'])
 @permission_classes([permissions.IsAuthenticated])
 def delete_offer_master_media(request, pk, media_id):
-    """
-    Delete a specific media file from an offer master
-    ADMIN ONLY - Only admin can delete media files
-    """
-    # CHECK: Only admin can delete media
     if request.user.user_type != 'admin':
-        return Response(
-            {"error": "Only administrators can delete media files"}, 
-            status=status.HTTP_403_FORBIDDEN
-        )
-    
+        return Response({"error": "Only administrators can delete media files"}, status=status.HTTP_403_FORBIDDEN)
     try:
         media = OfferMasterMedia.objects.get(id=media_id, offer_master_id=pk)
-        
-        # Delete the media file
         media.delete()
-        return Response(
-            {"message": "Media file deleted successfully"}, 
-            status=status.HTTP_200_OK
-        )
+        return Response({"message": "Media file deleted successfully"}, status=status.HTTP_200_OK)
     except OfferMasterMedia.DoesNotExist:
-        return Response(
-            {"error": "Media file not found"}, 
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"error": "Media file not found"}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
-        print(f"Error deleting media: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {"error": f"Failed to delete media file: {str(e)}"}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({"error": f"Failed to delete media file: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def offer_master_stats(request):
-    """
-    Get statistics about offer masters
-    - Admin: stats about offers they created
-    - User: stats about all offers (read-only)
-    """
     user = request.user
-    
     if user.user_type == 'admin':
-        # Admin sees their own created offers
-        total = OfferMaster.objects.filter(user=user).count()
-        active = OfferMaster.objects.filter(user=user, status='active').count()
-        inactive = OfferMaster.objects.filter(user=user, status='inactive').count()
+        total     = OfferMaster.objects.filter(user=user).count()
+        active    = OfferMaster.objects.filter(user=user, status='active').count()
+        inactive  = OfferMaster.objects.filter(user=user, status='inactive').count()
         scheduled = OfferMaster.objects.filter(user=user, status='scheduled').count()
     else:
-        # Regular users see ALL offers (read-only)
-        total = OfferMaster.objects.all().count()
-        active = OfferMaster.objects.filter(status='active').count()
-        inactive = OfferMaster.objects.filter(status='inactive').count()
+        total     = OfferMaster.objects.all().count()
+        active    = OfferMaster.objects.filter(status='active').count()
+        inactive  = OfferMaster.objects.filter(status='inactive').count()
         scheduled = OfferMaster.objects.filter(status='scheduled').count()
-
-    return Response({
-        'total': total,
-        'active': active,
-        'inactive': inactive,
-        'scheduled': scheduled
-    })
+    return Response({'total': total, 'active': active, 'inactive': inactive, 'scheduled': scheduled})
 
 
 # ===================== BRANCH-SPECIFIC VIEWS =====================
@@ -789,136 +683,55 @@ def offer_master_stats(request):
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_user_branches(request):
-    """
-    Get all branches belonging to the logged-in user
-    Returns branches with basic info (no offers)
-    """
-    user = request.user
-    
     try:
-        branches = BranchMaster.objects.filter(
-            user=user, 
-            status='active'
-        ).order_by('branch_name')
-        
-        serializer = BranchMasterSerializer(
-            branches, 
-            many=True, 
-            context={'request': request}
-        )
-        
-        return Response({
-            'success': True,
-            'count': branches.count(),
-            'branches': serializer.data
-        })
+        branches   = BranchMaster.objects.filter(user=request.user, status='active').order_by('branch_name')
+        serializer = BranchMasterSerializer(branches, many=True, context={'request': request})
+        return Response({'success': True, 'count': branches.count(), 'branches': serializer.data})
     except Exception as e:
-        print(f"Error fetching user branches: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {'error': f'Failed to fetch branches: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({'error': f'Failed to fetch branches: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_branch_offers(request, branch_id):
-    """
-    Get all offers assigned to a specific branch
-    Only if the branch belongs to the logged-in user
-    Returns branch info + its offers
-    """
-    # Auto-expire any offers whose valid_to has passed
     auto_expire_offers()
-
-    user = request.user
-    
     try:
-        # Verify the branch belongs to this user
-        branch = BranchMaster.objects.prefetch_related(
-            'offers', 
-            'offers__media_files'
-        ).get(id=branch_id, user=user)
-        
+        branch = BranchMaster.objects.prefetch_related('offers', 'offers__media_files').get(id=branch_id, user=request.user)
     except BranchMaster.DoesNotExist:
-        return Response({
-            'success': False,
-            'error': 'Branch not found or you do not have access'
-        }, status=status.HTTP_404_NOT_FOUND)
-    
+        return Response({'success': False, 'error': 'Branch not found or you do not have access'}, status=status.HTTP_404_NOT_FOUND)
     try:
-        # Get active offers for this branch
-        offers = branch.offers.filter(status='active').order_by('-created_at')
-        
-        # Serialize branch with offers
+        offers            = branch.offers.filter(status='active').order_by('-created_at')
         branch_serializer = BranchMasterSerializer(branch, context={'request': request})
         offers_serializer = OfferMasterSerializer(offers, many=True, context={'request': request})
-        
-        return Response({
-            'success': True,
-            'branch': branch_serializer.data,
-            'offers_count': offers.count(),
-            'offers': offers_serializer.data
-        })
+        return Response({'success': True, 'branch': branch_serializer.data, 'offers_count': offers.count(), 'offers': offers_serializer.data})
     except Exception as e:
-        print(f"Error fetching branch offers: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {'error': f'Failed to fetch offers: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({'error': f'Failed to fetch offers: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_all_branches_dropdown(request):
-    """
-    Get all branches for admin dropdown (when assigning offers)
-    Admin sees all branches, regular users see only their branches
-    Returns simplified data for dropdown selection
-    """
     user = request.user
-    
     try:
         if user.user_type == 'admin':
-            # Admin sees all active branches from all users
-            branches = BranchMaster.objects.filter(
-                status='active'
-            ).select_related('user').order_by('user__shop_name', 'branch_name')
+            branches = BranchMaster.objects.filter(status='active').select_related('user').order_by('user__shop_name', 'branch_name')
         else:
-            # Regular users see only their branches
-            branches = BranchMaster.objects.filter(
-                user=user, 
-                status='active'
-            ).order_by('branch_name')
-        
-        # Simple format for dropdown
+            branches = BranchMaster.objects.filter(user=user, status='active').order_by('branch_name')
         branch_list = [{
-            'id': str(branch.id),
-            'label': f"{branch.branch_name} ({branch.branch_code}) - {branch.user.shop_name or branch.user.username}",
+            'id':          str(branch.id),
+            'label':       f"{branch.branch_name} ({branch.branch_code}) - {branch.user.shop_name or branch.user.username}",
             'branch_name': branch.branch_name,
             'branch_code': branch.branch_code,
-            'shop_name': branch.user.shop_name or branch.user.username,
-            'user_id': branch.user.id,
-            'location': branch.location
+            'shop_name':   branch.user.shop_name or branch.user.username,
+            'user_id':     branch.user.id,
+            'location':    branch.location
         } for branch in branches]
-        
-        return Response({
-            'success': True,
-            'count': len(branch_list),
-            'branches': branch_list
-        })
+        return Response({'success': True, 'count': len(branch_list), 'branches': branch_list})
     except Exception as e:
-        print(f"Error fetching branches dropdown: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {'error': f'Failed to fetch branches: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({'error': f'Failed to fetch branches: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ===================== PUBLIC OFFER DISCOVERY =====================
@@ -926,120 +739,47 @@ def get_all_branches_dropdown(request):
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
 def discover_offers(request):
-    """
-    PUBLIC ENDPOINT: Discover all active offers
-    Anyone can see this - no authentication required
-    Supports filtering by location, city, branch_id
-
-    Query Parameters:
-        - location: Filter by branch location (case-insensitive search)
-        - city: Filter by branch city (case-insensitive search)
-        - branch_id: Filter by specific branch ID
-
-    Example:
-        GET /api/public/offers/
-        GET /api/public/offers/?location=Kozhikode
-        GET /api/public/offers/?city=Kochi
-        GET /api/public/offers/?branch_id=<uuid>
-    """
     try:
-        # Auto-expire any offers whose valid_to has passed
         auto_expire_offers()
-
-        # Get query parameters for filtering
-        location = request.query_params.get('location', None)
-        city = request.query_params.get('city', None)
+        location  = request.query_params.get('location', None)
+        city      = request.query_params.get('city', None)
         branch_id = request.query_params.get('branch_id', None)
-        
-        # Start with all offers that are date-valid and not manually disabled
-        today = timezone.localdate()
-        offers = OfferMaster.objects.filter(
-            valid_from__lte=today,
-            valid_to__gte=today,
+        today     = timezone.localdate()
+        offers    = OfferMaster.objects.filter(
+            valid_from__lte=today, valid_to__gte=today,
         ).exclude(status='inactive').prefetch_related('branches', 'branches__user', 'media_files')
-        
-        # Filter by branch if specified
         if branch_id:
             offers = offers.filter(branches__id=branch_id)
-        # Filter by location/city if no branch specified
         elif location:
             offers = offers.filter(branches__location__icontains=location)
         elif city:
             offers = offers.filter(branches__city__icontains=city)
-        
-        offers = offers.distinct().order_by('-created_at')
-        
-        # Serialize the offers
+        offers     = offers.distinct().order_by('-created_at')
         serializer = OfferMasterSerializer(offers, many=True, context={'request': request})
-        
-        return Response({
-            'success': True,
-            'count': offers.count(),
-            'offers': serializer.data
-        })
+        return Response({'success': True, 'count': offers.count(), 'offers': serializer.data})
     except Exception as e:
-        print(f"Error discovering offers: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {'error': f'Failed to discover offers: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({'error': f'Failed to discover offers: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
 def get_all_active_branches_public(request):
-    """
-    PUBLIC ENDPOINT: Get all active branches with their offers
-    Anyone can see this to discover shops and their offers
-
-    Query Parameters:
-        - location: Filter by branch location (case-insensitive search)
-        - city: Filter by branch city (case-insensitive search)
-
-    Example:
-        GET /api/public/branches/
-        GET /api/public/branches/?location=Kozhikode
-        GET /api/public/branches/?city=Kochi
-    """
     try:
-        # Auto-expire any offers whose valid_to has passed
         auto_expire_offers()
-
-        # Get query parameters for filtering
         location = request.query_params.get('location', None)
-        city = request.query_params.get('city', None)
-        
-        # Get all active branches
-        branches = BranchMaster.objects.filter(
-            status='active'
-        ).select_related('user').prefetch_related('offers', 'offers__media_files')
-        
-        # Apply filters if provided
+        city     = request.query_params.get('city', None)
+        branches = BranchMaster.objects.filter(status='active').select_related('user').prefetch_related('offers', 'offers__media_files')
         if location:
             branches = branches.filter(location__icontains=location)
         if city:
             branches = branches.filter(city__icontains=city)
-        
-        branches = branches.order_by('user__shop_name', 'branch_name')
-        
-        # Serialize with offers
+        branches   = branches.order_by('user__shop_name', 'branch_name')
         serializer = BranchWithOffersSerializer(branches, many=True, context={'request': request})
-        
-        return Response({
-            'success': True,
-            'count': branches.count(),
-            'branches': serializer.data
-        })
+        return Response({'success': True, 'count': branches.count(), 'branches': serializer.data})
     except Exception as e:
-        print(f"Error fetching public branches: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        return Response(
-            {'error': f'Failed to fetch branches: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        import traceback; traceback.print_exc()
+        return Response({'error': f'Failed to fetch branches: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ===================== TEMPLATES =====================
@@ -1062,34 +802,13 @@ class TemplateListView(APIView):
 @api_view(["GET"])
 @permission_classes([permissions.IsAuthenticated])
 def user_dashboard_stats(request):
-    """
-    Returns real-time counts for the user dashboard:
-    - Total categories (global count)
-    - Total products for this user
-    - Active offers (products with is_active=True for this user)
-    - Total offer masters for this user
-    """
     user = request.user
-    
-    # Count all categories (categories are global, not per-user)
-    total_categories = Category.objects.count()
-    
-    # Count all products for this user
-    total_products = Product.objects.filter(user=user).count()
-    
-    # Count active offers (products with is_active=True)
-    active_offers = Product.objects.filter(user=user, is_active=True).count()
-    
-    # Count offer masters
-    total_offer_masters = OfferMaster.objects.filter(user=user).count()
-    active_offer_masters = OfferMaster.objects.filter(user=user, status='active').count()
-    
     return Response({
-        "total_categories": total_categories,
-        "total_products": total_products,
-        "active_offers": active_offers,
-        "total_offer_masters": total_offer_masters,
-        "active_offer_masters": active_offer_masters,
+        "total_categories":     Category.objects.count(),
+        "total_products":       Product.objects.filter(user=user).count(),
+        "active_offers":        Product.objects.filter(user=user, is_active=True).count(),
+        "total_offer_masters":  OfferMaster.objects.filter(user=user).count(),
+        "active_offer_masters": OfferMaster.objects.filter(user=user, status='active').count(),
     })
 
 
@@ -1101,9 +820,6 @@ def user_profile(request):
     user = request.user
     if request.method == "GET":
         return Response(UserPublicSerializer(user).data)
-
-    # For update, keep using full serializer only if you want to allow all fields.
-    # Better: create a dedicated "UserUpdateSerializer". Leaving as-is for minimal change.
     serializer = UserSerializer(user, data=request.data, partial=True)
     if serializer.is_valid():
         serializer.save()
@@ -1119,8 +835,13 @@ class AdminListView(APIView):
     def get(self, request):
         try:
             search_term = request.GET.get("search", "")
-            queryset = User.objects.filter(user_type="user")
-
+            # Get all phone numbers from AccMaster that belong to this admin's client_id
+            admin_client_id = getattr(request.user, 'client_id', '') or ''
+            phones = AccMaster.objects.filter(
+                client_id=admin_client_id
+            ).values_list('phone2', flat=True)
+            phone_list = [p[-10:] for p in phones if p and len(p) >= 10]
+            queryset = User.objects.filter(user_type="user", phone_number__in=phone_list)
             if search_term:
                 queryset = queryset.filter(
                     Q(username__icontains=search_term) |
@@ -1128,7 +849,6 @@ class AdminListView(APIView):
                     Q(shop_name__icontains=search_term) |
                     Q(location__icontains=search_term)
                 )
-
             queryset = queryset.order_by("-date_joined")
             return Response(UserPublicSerializer(queryset, many=True).data)
         except Exception as e:
@@ -1137,16 +857,14 @@ class AdminListView(APIView):
     def post(self, request):
         try:
             data = request.data.copy()
-            data["user_type"] = "user"
+            data["user_type"]     = "user"
             data["business_name"] = data.get("customer_name", "")
-
             serializer = UserSerializer(data=data)
             if serializer.is_valid():
                 user = serializer.save()
                 user.set_password(data.get("password"))
                 user.save()
                 return Response(UserPublicSerializer(user).data, status=201)
-
             return Response(serializer.errors, status=400)
         except Exception as e:
             return Response({"error": str(e)}, status=500)
@@ -1154,7 +872,7 @@ class AdminListView(APIView):
 
 class AdminDetailView(generics.RetrieveUpdateDestroyAPIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminUser]
-    serializer_class = UserSerializer
+    serializer_class   = UserSerializer
 
     def get_queryset(self):
         return User.objects.filter(user_type="user")
@@ -1171,77 +889,55 @@ class AdminStatsView(APIView):
     permission_classes = [permissions.IsAuthenticated, IsAdminUser]
 
     def get(self, request):
+        admin_client_id = getattr(request.user, 'client_id', '') or ''
+        phones = AccMaster.objects.filter(
+            client_id=admin_client_id
+        ).values_list('phone2', flat=True)
+        phone_list = [p[-10:] for p in phones if p and len(p) >= 10]
+        base_qs = User.objects.filter(user_type="user", phone_number__in=phone_list)
         return Response({
-            "total_admins": User.objects.filter(user_type="user").count(),
-            "active_admins": User.objects.filter(user_type="user", status="Active").count(),
-            "disabled_admins": User.objects.filter(user_type="user", status="Disable").count(),
+            "total_admins":    base_qs.count(),
+            "active_admins":   base_qs.filter(status="Active").count(),
+            "disabled_admins": base_qs.filter(status="Disable").count(),
         })
 
 
 # ===================== BRANCH MASTER =====================
 
 class BranchMasterListCreateView(APIView):
-    """
-    GET: List all branches (Admin sees ALL, users see their own)
-    POST: Create a new branch
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
         try:
-            # Admin sees ALL branches from ALL users
             if request.user.is_superuser or request.user.user_type == 'admin':
                 branches = BranchMaster.objects.all().select_related('user')
             else:
-                # Regular users see only their branches
                 branches = BranchMaster.objects.filter(user=request.user)
-            
             serializer = BranchMasterSerializer(branches, many=True, context={'request': request})
             return Response(serializer.data, status=status.HTTP_200_OK)
-        
         except Exception as e:
-            return Response(
-                {'error': f'Failed to fetch branches: {str(e)}'}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'Failed to fetch branches: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def post(self, request):
         try:
-            serializer = BranchMasterCreateUpdateSerializer(
-                data=request.data, 
-                context={'request': request}
-            )
-            
+            serializer = BranchMasterCreateUpdateSerializer(data=request.data, context={'request': request})
             if serializer.is_valid():
-                # Admin can specify which user the branch belongs to
                 if not (request.user.is_superuser or request.user.user_type == 'admin'):
                     serializer.validated_data['user'] = request.user
-                
                 branch = serializer.save()
-                branch.refresh_from_db()  # ensures qr_code is loaded after generation
+                branch.refresh_from_db()
                 response_serializer = BranchMasterSerializer(branch, context={'request': request})
                 return Response(response_serializer.data, status=status.HTTP_201_CREATED)
-            
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
         except Exception as e:
-            return Response(
-                {'error': f'Failed to create branch: {str(e)}'}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'Failed to create branch: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class BranchMasterDetailView(APIView):
-    """
-    GET: Retrieve a specific branch
-    PATCH: Update a specific branch
-    DELETE: Delete a specific branch
-    """
     permission_classes = [permissions.IsAuthenticated]
 
     def get_object(self, pk, user):
         try:
-            # Admin can access any branch
             if user.is_superuser or user.user_type == 'admin':
                 return BranchMaster.objects.get(pk=pk)
             else:
@@ -1251,124 +947,65 @@ class BranchMasterDetailView(APIView):
 
     def get(self, request, pk):
         branch = self.get_object(pk, request.user)
-        
         if not branch:
-            return Response(
-                {'error': 'Branch not found or you do not have permission to view it'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
+            return Response({'error': 'Branch not found or you do not have permission to view it'}, status=status.HTTP_404_NOT_FOUND)
         serializer = BranchMasterSerializer(branch, context={'request': request})
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     def patch(self, request, pk):
         branch = self.get_object(pk, request.user)
-        
         if not branch:
-            return Response(
-                {'error': 'Branch not found or you do not have permission to update it'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
+            return Response({'error': 'Branch not found or you do not have permission to update it'}, status=status.HTTP_404_NOT_FOUND)
         try:
-            serializer = BranchMasterCreateUpdateSerializer(
-                branch, 
-                data=request.data, 
-                partial=True,
-                context={'request': request}
-            )
-            
+            serializer = BranchMasterCreateUpdateSerializer(branch, data=request.data, partial=True, context={'request': request})
             if serializer.is_valid():
                 updated_branch = serializer.save()
-                updated_branch.refresh_from_db()  # ensures qr_code is loaded after generation
-                response_serializer = BranchMasterSerializer(
-                    updated_branch, 
-                    context={'request': request}
-                )
+                updated_branch.refresh_from_db()
+                response_serializer = BranchMasterSerializer(updated_branch, context={'request': request})
                 return Response(response_serializer.data, status=status.HTTP_200_OK)
-            
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-        
         except Exception as e:
-            return Response(
-                {'error': f'Failed to update branch: {str(e)}'}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'Failed to update branch: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     def delete(self, request, pk):
         branch = self.get_object(pk, request.user)
-        
         if not branch:
-            return Response(
-                {'error': 'Branch not found or you do not have permission to delete it'},
-                status=status.HTTP_404_NOT_FOUND
-            )
-        
+            return Response({'error': 'Branch not found or you do not have permission to delete it'}, status=status.HTTP_404_NOT_FOUND)
         try:
             branch.delete()
-            return Response(
-                {'message': 'Branch deleted successfully'},
-                status=status.HTTP_204_NO_CONTENT
-            )
+            return Response({'message': 'Branch deleted successfully'}, status=status.HTTP_204_NO_CONTENT)
         except Exception as e:
-            return Response(
-                {'error': f'Failed to delete branch: {str(e)}'}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+            return Response({'error': f'Failed to delete branch: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def branch_master_stats(request):
-    """
-    Get statistics about branches
-    """
     try:
-        # Admin sees ALL branches stats
         if request.user.is_superuser or request.user.user_type == 'admin':
             branches = BranchMaster.objects.all()
         else:
             branches = BranchMaster.objects.filter(user=request.user)
-        
-        stats = {
-            'total_branches': branches.count(),
-            'active_branches': branches.filter(status='active').count(),
+        return Response({
+            'total_branches':    branches.count(),
+            'active_branches':   branches.filter(status='active').count(),
             'inactive_branches': branches.filter(status='inactive').count(),
-        }
-        
-        return Response(stats, status=status.HTTP_200_OK)
-    
+        }, status=status.HTTP_200_OK)
     except Exception as e:
-        return Response(
-            {'error': f'Failed to fetch branch statistics: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        return Response({'error': f'Failed to fetch branch statistics: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def get_all_users_for_dropdown(request):
-    """
-    Get list of all users for dropdown selection (Admin only)
-    """
     try:
-        # Only admins can access this
         if not (request.user.is_superuser or request.user.user_type == 'admin'):
-            return Response(
-                {'error': 'Permission denied'},
-                status=status.HTTP_403_FORBIDDEN
-            )
-        
-        # Get all users except admins
-        users = User.objects.filter(user_type='user').order_by('username')
+            return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
+        users      = User.objects.filter(user_type='user').order_by('username')
         serializer = UserSimpleSerializer(users, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
-    
     except Exception as e:
-        return Response(
-            {'error': f'Failed to fetch users: {str(e)}'}, 
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
+        return Response({'error': f'Failed to fetch users: {str(e)}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # ===================== MISEL SHOP SYNC =====================
@@ -1377,50 +1014,31 @@ def get_all_users_for_dropdown(request):
 @permission_classes([permissions.IsAuthenticated])
 def sync_misel_shops(request):
     """
-    Admin only.
-    Fetches shops from the Misel API and creates User records for any shop
-    that doesn't already exist in the system.
-    Uses firm_name as shop_name and generates a username from misel_<id>.
-    After syncing, the existing GET /api/users/dropdown/ will automatically
-    include these shops in the User/Shop dropdown.
+    Syncs shops from Misel model into local User records.
+    Reads directly from the default DB.
     """
     if not (request.user.is_superuser or request.user.user_type == 'admin'):
         return Response({'error': 'Permission denied'}, status=status.HTTP_403_FORBIDDEN)
 
-    try:
-        response = http_requests.get('https://vsaverapi.imcbs.com/api/misel/', timeout=10)
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        return Response(
-            {'error': f'Failed to fetch Misel API: {str(e)}'},
-            status=status.HTTP_502_BAD_GATEWAY
-        )
+    # ✅ Read Misel records from the default DB
+    misel_records = Misel.objects.all()
 
-    # ✅ FIX: Misel API returns a plain list [], not {"results": []}
-    # Calling .get() on a list raises AttributeError → 500. Handle both shapes.
-    shops = data if isinstance(data, list) else data.get('results', [])
-    created = []
-    skipped = []
-    no_client_id = []
+    created       = []
+    skipped       = []
+    no_client_id  = []
 
-    for shop in shops:
-        firm_name = shop.get('firm_name', '').strip()
-        address   = shop.get('address1',  '').strip()
-        misel_id  = shop.get('id')
-        client_id = (shop.get('client_id') or '').strip()
+    for shop in misel_records:
+        firm_name = (shop.firm_name or '').strip()
+        address   = (shop.address1  or '').strip()
+        client_id = (shop.client_id or '').strip()
 
         if not firm_name:
             continue
 
-        # ✅ client_id is the stable business key — use it when available.
-        # Fall back to misel_{id} only for shops not yet assigned a client_id.
-        # Once client_id is assigned upstream, re-running sync will create
-        # the correct misel_{client_id} user automatically.
         if client_id:
             base_username = f"misel_{client_id}"
         else:
-            base_username = f"misel_{misel_id}"
+            base_username = f"misel_{shop.id}"
             no_client_id.append(firm_name)
 
         if User.objects.filter(username=base_username).exists():
@@ -1433,7 +1051,7 @@ def sync_misel_shops(request):
             password=secrets.token_urlsafe(16),
             user_type='user',
             shop_name=firm_name,
-            business_name=client_id,  # store client_id here for easy lookup
+            business_name=client_id,
             location=address,
             status='Active',
         )
@@ -1448,7 +1066,7 @@ def sync_misel_shops(request):
         'no_client_id':  no_client_id,
         'message': (
             f'{len(created)} shop(s) synced, {len(skipped)} already existed'
-            + (f', {len(no_client_id)} missing client_id (used misel_id fallback).' if no_client_id else '.')
+            + (f', {len(no_client_id)} missing client_id (used id fallback).' if no_client_id else '.')
         )
     }, status=status.HTTP_200_OK)
 
@@ -1458,54 +1076,36 @@ def sync_misel_shops(request):
 @api_view(['GET'])
 @permission_classes([permissions.AllowAny])
 def public_branch_offers(request, branch_id):
-    """
-    PUBLIC — no auth needed.
-    Called when customer scans the branch QR code.
-    Returns branch info + all active offers for that branch.
-    """
-    # Auto-expire any offers whose valid_to has passed
     auto_expire_offers()
-
     try:
-        branch = BranchMaster.objects.prefetch_related(
-            'offers',
-            'offers__media_files',
-            'user',
-        ).get(id=branch_id)
+        branch = BranchMaster.objects.prefetch_related('offers', 'offers__media_files', 'user').get(id=branch_id)
     except BranchMaster.DoesNotExist:
         return Response({'error': 'Branch not found.'}, status=status.HTTP_404_NOT_FOUND)
-
     serializer = BranchWithOffersSerializer(branch, context={'request': request})
     return Response(serializer.data)
 
-# ===================== USER INVOICES (E-Invoice History) =====================
 
-INVOICES_API_URL = "https://vsaverapi.imcbs.com/api/invoices/"
-
+# ===================== USER INVOICES =====================
 
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def user_invoices(request):
     """
-    Returns invoices for the logged-in user by matching their debtor_code
-    (stored in username as debtor_<code>_<phone>) against customerid in
-    the external invoices API.
+    Returns invoices from AccInvMast model (single DB).
 
-    Handles both plain list [] and paginated {"results":[], "next":...} responses.
+    Matches by debtor_code (extracted from username: debtor_<code>_<phone>)
+    against customerid in AccInvMast.
 
     Query params:
-      ?debtor_code=<code>   — override auto-detected code (optional)
-      ?limit=<n>            — max invoices to return (default 20, max 50)
+      ?debtor_code=<code>  — override auto-detected code (optional)
+      ?limit=<n>           — max invoices to return (default 20, max 50)
     """
-    # ── 1. Resolve debtor_code from username ──────────────────────
     debtor_code = request.query_params.get('debtor_code', '').strip()
 
     if not debtor_code:
-        # Username pattern: debtor_<code>_<phone>  e.g. debtor_.,DBH_9656938213
         username = getattr(request.user, 'username', '') or ''
         if username.startswith('debtor_'):
             inner = username[len('debtor_'):]
-            # phone is always the last segment after final underscore
             parts = inner.rsplit('_', 1)
             debtor_code = parts[0] if len(parts) == 2 else inner
 
@@ -1517,68 +1117,293 @@ def user_invoices(request):
 
     limit = min(int(request.query_params.get('limit', 20)), 50)
 
-    def _collect_invoices(base_url, max_pages=300):
-        """
-        Paginate through the invoices API (handles both list and dict responses)
-        and collect all invoices matching debtor_code.
-        """
-        collected = []
-        url = base_url
-        pages = 0
+    # ✅ Query directly from default DB — no external API needed
+    invoices_qs = AccInvMast.objects.filter(
+        customerid=debtor_code
+    ).order_by('-slno').values('slno', 'invdate', 'nettotal')[:limit]
 
-        while url and pages < max_pages:
-            try:
-                results, next_url = _safe_paginate(url, timeout=15)
-            except Exception as e:
-                raise Exception(f"Invoice API error: {e}")
-
-            pages += 1
-            for inv in results:
-                if (inv.get('customerid') or '').strip() == debtor_code:
-                    collected.append({
-                        'slno':     inv.get('slno'),
-                        'invdate':  inv.get('invdate'),
-                        'nettotal': inv.get('nettotal'),
-                    })
-
-            url = next_url
-
-        return collected
-
-    # ── 2. Try filtered endpoint first (fast path) ───────────────
-    try:
-        filtered_url = f"{INVOICES_API_URL}?customerid={debtor_code}&page_size=100"
-        test_results, _ = _safe_paginate(filtered_url, timeout=15)
-
-        # Verify the API actually filtered (all results must match our code)
-        api_filtered = bool(test_results) and all(
-            (r.get('customerid') or '').strip() == debtor_code
-            for r in test_results
-        )
-
-        if api_filtered:
-            # API supports filtering — paginate only filtered results (fast)
-            collected = _collect_invoices(filtered_url, max_pages=50)
-        else:
-            # API ignores the filter — fall back to full scan
-            raise ValueError("API does not support customerid filter")
-
-    except Exception:
-        # ── 3. Full scan fallback ─────────────────────────────────
-        try:
-            collected = _collect_invoices(INVOICES_API_URL, max_pages=300)
-        except Exception as e:
-            return Response(
-                {'error': f'Failed to fetch invoices: {str(e)}'},
-                status=503
-            )
-
-    # ── 4. Sort descending by slno and return top N ───────────────
-    collected.sort(key=lambda x: x.get('slno') or 0, reverse=True)
+    collected = [
+        {
+            'slno':     inv['slno'],
+            'invdate':  str(inv['invdate']) if inv['invdate'] else None,
+            'nettotal': str(inv['nettotal']) if inv['nettotal'] else "0",
+        }
+        for inv in invoices_qs
+    ]
 
     return Response({
         'success':     True,
         'debtor_code': debtor_code,
         'total_found': len(collected),
-        'invoices':    collected[:limit],
+        'invoices':    collected,
+    })
+
+# ================================================================
+# ===================== SYNC DATA VIEWS ==========================
+# All endpoints below are admin-only.
+# client_id in these tables is purely for login validation —
+# it is NOT used as a data filter here.
+# ================================================================
+
+def _require_admin(user):
+    """Returns True if the user is NOT an admin (used to block access)."""
+    return not (user.is_superuser or user.user_type == 'admin')
+
+
+# -------------------- AccMaster (Customers) ---------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def acc_master_list(request):
+    """
+    GET /api/acc-master/
+    Admin only. List all customers/debtors from the accounting system.
+
+    Query params:
+      ?search=<text>       — filter by name, code, phone2, or place
+      ?limit=<n>           — page size (default 50, max 200)
+      ?offset=<n>          — pagination offset (default 0)
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    admin_client_id = getattr(request.user, 'client_id', '') or ''
+    qs = AccMaster.objects.filter(client_id=admin_client_id).order_by('code')
+
+    search = request.query_params.get('search', '').strip()
+    if search:
+        qs = qs.filter(
+            Q(name__icontains=search)   |
+            Q(code__icontains=search)   |
+            Q(phone2__icontains=search) |
+            Q(place__icontains=search)
+        )
+
+    total  = qs.count()
+    limit  = min(int(request.query_params.get('limit',  50)), 200)
+    offset = int(request.query_params.get('offset', 0))
+    qs     = qs[offset: offset + limit]
+
+    return Response({
+        'total':   total,
+        'limit':   limit,
+        'offset':  offset,
+        'results': AccMasterSerializer(qs, many=True).data,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def acc_master_detail(request, pk):
+    """
+    GET /api/acc-master/<id>/
+    Admin only. Single customer record + their last 50 invoices.
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    try:
+        admin_client_id = getattr(request.user, 'client_id', '') or ''
+        obj = AccMaster.objects.get(pk=pk, client_id=admin_client_id)
+    except AccMaster.DoesNotExist:
+        return Response({'error': 'Customer not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    invoices = AccInvMast.objects.filter(
+        customerid=obj.code, client_id=admin_client_id
+    ).order_by('-slno').values('slno', 'invdate', 'nettotal')[:50]
+
+    invoice_data = [
+        {
+            'slno':     inv['slno'],
+            'invdate':  str(inv['invdate']) if inv['invdate'] else None,
+            'nettotal': str(inv['nettotal']) if inv['nettotal'] else '0',
+        }
+        for inv in invoices
+    ]
+
+    data = AccMasterSerializer(obj).data
+    data['invoices']      = invoice_data
+    data['invoice_count'] = len(invoice_data)
+    return Response(data)
+
+
+# -------------------- Misel (Shops) ---------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def misel_list(request):
+    """
+    GET /api/misel/
+    Admin only. List all synced shops/firms.
+
+    Query params:
+      ?search=<text>   — filter by firm_name or address
+      ?limit=<n>       — page size (default 50, max 200)
+      ?offset=<n>      — pagination offset
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    admin_client_id = getattr(request.user, 'client_id', '') or ''
+    qs = Misel.objects.filter(client_id=admin_client_id).order_by('firm_name')
+
+    search = request.query_params.get('search', '').strip()
+    if search:
+        qs = qs.filter(
+            Q(firm_name__icontains=search) |
+            Q(address1__icontains=search)
+        )
+
+    total  = qs.count()
+    limit  = min(int(request.query_params.get('limit',  50)), 200)
+    offset = int(request.query_params.get('offset', 0))
+    qs     = qs[offset: offset + limit]
+
+    return Response({
+        'total':   total,
+        'limit':   limit,
+        'offset':  offset,
+        'results': MiselSerializer(qs, many=True).data,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def misel_detail(request, pk):
+    """
+    GET /api/misel/<id>/
+    Admin only. Single shop/firm record.
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    try:
+        admin_client_id = getattr(request.user, 'client_id', '') or ''
+        obj = Misel.objects.get(pk=pk, client_id=admin_client_id)
+    except Misel.DoesNotExist:
+        return Response({'error': 'Shop not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    return Response(MiselSerializer(obj).data)
+
+
+# -------------------- AccInvMast (Invoices) ---------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def acc_inv_mast_list(request):
+    """
+    GET /api/invoices/
+    Admin only. List all invoices.
+
+    Query params:
+      ?customerid=<code>    — filter by customer code
+      ?date_from=YYYY-MM-DD — filter from date
+      ?date_to=YYYY-MM-DD   — filter to date
+      ?search=<text>        — filter by customerid or slno
+      ?limit=<n>            — page size (default 50, max 200)
+      ?offset=<n>           — pagination offset
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    admin_client_id = getattr(request.user, 'client_id', '') or ''
+    qs = AccInvMast.objects.filter(client_id=admin_client_id).order_by('-invdate', '-slno')
+
+    if request.query_params.get('customerid'):
+        qs = qs.filter(customerid=request.query_params['customerid'].strip())
+
+    if request.query_params.get('date_from'):
+        qs = qs.filter(invdate__gte=request.query_params['date_from'])
+
+    if request.query_params.get('date_to'):
+        qs = qs.filter(invdate__lte=request.query_params['date_to'])
+
+    search = request.query_params.get('search', '').strip()
+    if search:
+        qs = qs.filter(
+            Q(customerid__icontains=search) |
+            Q(slno__icontains=search)
+        )
+
+    total  = qs.count()
+    limit  = min(int(request.query_params.get('limit',  50)), 200)
+    offset = int(request.query_params.get('offset', 0))
+    qs     = qs[offset: offset + limit]
+
+    return Response({
+        'total':   total,
+        'limit':   limit,
+        'offset':  offset,
+        'results': AccInvMastSerializer(qs, many=True).data,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def acc_inv_mast_detail(request, pk):
+    """
+    GET /api/invoices/<id>/
+    Admin only. Single invoice + the matching customer name.
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    try:
+        admin_client_id = getattr(request.user, 'client_id', '') or ''
+        obj = AccInvMast.objects.get(pk=pk, client_id=admin_client_id)
+    except AccInvMast.DoesNotExist:
+        return Response({'error': 'Invoice not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    customer = AccMaster.objects.filter(code=obj.customerid, client_id=admin_client_id).first()
+
+    data = AccInvMastSerializer(obj).data
+    data['customer_name']  = customer.name  if customer else None
+    data['customer_place'] = customer.place if customer else None
+    return Response(data)
+
+
+# -------------------- Summary Stats (Admin only) ---------------------
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def sync_data_stats(request):
+    """
+    GET /api/sync-data/stats/
+    Admin only. Quick summary counts for all three sync tables.
+    """
+    if _require_admin(request.user):
+        return Response({'error': 'Admin access only.'}, status=status.HTTP_403_FORBIDDEN)
+
+    admin_client_id = getattr(request.user, 'client_id', '') or ''
+    return Response({
+        'acc_master_total': AccMaster.objects.filter(client_id=admin_client_id).count(),
+        'misel_total':      Misel.objects.filter(client_id=admin_client_id).count(),
+        'invoices_total':   AccInvMast.objects.filter(client_id=admin_client_id).count(),
+    })
+
+
+# ===================== MY POINTS (User-facing) =====================
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def my_points(request):
+    """
+    GET /api/my-points/
+    Returns the current user's exregnodate value as 'points'.
+    Looks up the user by phone_number in AccMaster so the value is
+    always live (not stale from the last login).
+    Sends the raw string exactly as stored in the DB — no rounding,
+    no formatting, no conversion.
+    """
+    user  = request.user
+    phone = (getattr(user, 'phone_number', '') or '').strip().lstrip('+')
+    if len(phone) > 10:
+        phone = phone[-10:]
+
+    record = AccMaster.objects.filter(phone2__endswith=phone).first() if phone else None
+
+    raw = (record.exregnodate or '0') if record else '0'
+
+    return Response({
+        'points': raw.strip() if raw else '0',
     })

@@ -6,7 +6,7 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 from django.conf import settings
 
-# ---------- User (unchanged) ----------
+# ---------- User ----------
 class User(AbstractUser):
     USER_TYPE_CHOICES = (
         ('admin', 'Admin'),
@@ -39,16 +39,18 @@ class User(AbstractUser):
     def __str__(self):
         return f"{self.username} ({self.user_type})"
 
-# ---------- Category (unchanged) ----------
+
+# ---------- Category ----------
 class Category(models.Model):
-    name = models.CharField(max_length=200, unique=True) 
+    name = models.CharField(max_length=200, unique=True)
     description = models.TextField(blank=True, null=True, default='')
     image = models.ImageField(upload_to="categories/", null=True, blank=True)
 
     def __str__(self):
         return self.name
 
-# ---------- Product (mostly same) ----------
+
+# ---------- Product ----------
 class Product(models.Model):
     TEMPLATE_CHOICES = [
         ('template1', 'Template 1'),
@@ -111,7 +113,8 @@ class Product(models.Model):
     def __str__(self):
         return self.product_name
 
-# ---------- Offer (existing) ----------
+
+# ---------- Offer ----------
 class Offer(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
@@ -191,10 +194,7 @@ class BranchMaster(models.Model):
     manager_phone = models.CharField(max_length=20, blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     branch_image = models.ImageField(upload_to='branch_images/', blank=True, null=True)
-
-    # ✅ NEW: QR code that points to this branch's public offers page
     qr_code = models.ImageField(upload_to='branch_qr/', blank=True, null=True)
-
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -205,7 +205,6 @@ class BranchMaster(models.Model):
 
     def save(self, *args, **kwargs):
         super().save(*args, **kwargs)
-        # Auto-generate QR on first save
         if not self.qr_code:
             try:
                 self.generate_qr()
@@ -213,16 +212,10 @@ class BranchMaster(models.Model):
                 print(f"Branch QR generation error: {e}")
 
     def get_public_url(self):
-        """
-        Returns the URL customers land on when they scan this branch's QR.
-        Points to the frontend branch offers page.
-        Example: https://yourapp.com/branch/<uuid>/offers
-        """
         site = getattr(settings, 'FRONTEND_URL', 'http://192.168.1.45:5173')
         return f"{site}/branch/{self.id}/offers"
 
     def generate_qr(self):
-        """Generate a QR code that encodes the public branch offers URL."""
         url = self.get_public_url()
         qr = qrcode.QRCode(
             version=1,
@@ -257,19 +250,15 @@ class OfferMaster(models.Model):
     description = models.TextField(blank=True, null=True)
     valid_from = models.DateField()
     valid_to = models.DateField()
-    # Optional hourly window — if both are set the offer is only active between these times
     offer_start_time = models.TimeField(blank=True, null=True, help_text="Daily start time for hourly offers (e.g. 15:00)")
     offer_end_time   = models.TimeField(blank=True, null=True, help_text="Daily end time for hourly offers (e.g. 17:00)")
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
-    
-    # Many-to-Many relationship with BranchMaster
     branches = models.ManyToManyField(
-        BranchMaster, 
-        related_name='offers', 
+        BranchMaster,
+        related_name='offers',
         blank=True,
         help_text="Branches where this offer is available"
     )
-    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -294,8 +283,8 @@ class OfferMasterMedia(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     offer_master = models.ForeignKey(
-        OfferMaster, 
-        on_delete=models.CASCADE, 
+        OfferMaster,
+        on_delete=models.CASCADE,
         related_name='media_files'
     )
     file = models.FileField(upload_to='offer_master_media/')
@@ -320,3 +309,55 @@ class OfferMasterMedia(models.Model):
 
     def __str__(self):
         return f"{self.media_type.upper()} for {self.offer_master.title}"
+
+
+# ---------- Sync Models (External DB Sync) ----------
+
+class AccMaster(models.Model):
+    code        = models.CharField(max_length=30)
+    name        = models.CharField(max_length=250)
+    place       = models.CharField(max_length=60,  null=True, blank=True)
+    exregnodate = models.CharField(max_length=30,  null=True, blank=True)
+    super_code  = models.CharField(max_length=5,   null=True, blank=True)
+    phone2      = models.CharField(max_length=60,  null=True, blank=True)
+    client_id   = models.CharField(max_length=50,  db_index=True)
+    synced_at   = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table        = 'acc_master_sync'
+        ordering        = ['code']
+        unique_together = [('code', 'client_id')]
+
+    def __str__(self):
+        return f"{self.code} - {self.name} [{self.client_id}]"
+
+
+class Misel(models.Model):
+    firm_name = models.CharField(max_length=150, null=True, blank=True)
+    address1  = models.CharField(max_length=50,  null=True, blank=True)
+    client_id = models.CharField(max_length=50,  db_index=True)
+    synced_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table        = 'misel_sync'
+        unique_together = [('firm_name', 'client_id')]
+
+    def __str__(self):
+        return f"{self.firm_name} [{self.client_id}]"
+
+
+class AccInvMast(models.Model):
+    slno       = models.BigIntegerField()
+    invdate    = models.DateField(null=True, blank=True)
+    customerid = models.CharField(max_length=30, null=True, blank=True)
+    nettotal   = models.DecimalField(max_digits=16, decimal_places=3, null=True, blank=True)
+    client_id  = models.CharField(max_length=50,  db_index=True)
+    synced_at  = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table        = 'acc_invmast_sync'
+        ordering        = ['-invdate', '-slno']
+        unique_together = [('slno', 'client_id')]
+
+    def __str__(self):
+        return f"Invoice {self.slno} | {self.customerid} | {self.client_id}"
