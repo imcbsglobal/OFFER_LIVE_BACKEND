@@ -121,8 +121,10 @@ def admin_login(request):
 
 
 # ─── WhatsApp OTP (AiSensy) ───────────────────────────────────────────────────
-AISENSY_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY4NTI4ZmIxYjk4ZTc1NzI2ZTYxZjY2ZCIsIm5hbWUiOiJ2Y2FyZW1hcnQiLCJhcHBOYW1lIjoiQWlTZW5zeSIsImNsaWVudElkIjoiNjg1MjhmYjFiOThlNzU3MjZlNjFmNjVmIiwiYWN0aXZlUGxhbiI6Ik5PTkUiLCJpYXQiOjE3NTAyNDEyMDF9.XK_zrkUHTI1-Rlvjsue1QGacohAnqnos6h97z6QCb_A"
+AISENSY_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjY0ZDM2ZTZiNzNjM2NmMjIwNmE4MjA2OCIsIm5hbWUiOiJjaGF0aWNvIGFsZXJ0IiwiYXBwTmFtZSI6IkFpU2Vuc3kiLCJjbGllbnRJZCI6IjY0ZDM2ZTZhNzNjM2NmMjIwNmE4MjA2MyIsImFjdGl2ZVBsYW4iOiJCQVNJQ19NT05USExZIiwiaWF0IjoxNzYyMTUyODUyfQ.Rl0OfVFNGiUd8vdaNHX9R0vBJLTdFa3Y7X-smA92c8w"
 AISENSY_URL     = "https://backend.api-wa.co/campaign/chatico/api/v2"
+AISENSY_CAMPAIGN = "testingauthentication"
+AISENSY_USERNAME = "chatico alert"
 
 
 def _find_debtor_by_phone(phone_number):
@@ -145,6 +147,11 @@ def _find_debtor_by_phone(phone_number):
 @api_view(["POST"])
 @permission_classes([permissions.AllowAny])
 def user_login(request):
+    """
+    DEPRECATED direct login — now redirects users to the OTP flow.
+    POST { phone_number: "9XXXXXXXXX" }
+    Checks if the number exists, then triggers OTP automatically.
+    """
     phone_number = request.data.get("phone_number", "").strip().replace(" ", "")
 
     if not phone_number or not phone_number.lstrip("+").isdigit() or len(phone_number.lstrip("+")) < 10:
@@ -152,42 +159,43 @@ def user_login(request):
 
     phone_number = phone_number[-10:]
 
-    debtor = _find_debtor_by_phone(phone_number)
+    # Check if number exists in AccMaster or local DB
+    local_user = User.objects.filter(phone_number=phone_number).first()
+    if not local_user:
+        debtor = _find_debtor_by_phone(phone_number)
+        if not debtor:
+            return Response(
+                {"error": "Mobile number not registered. Please contact your admin."},
+                status=404
+            )
+        name = (debtor.get("name") or "user").split()[0]
+    else:
+        if _block_if_disabled(local_user):
+            return Response({"error": "Your account is disabled. Please contact admin."}, status=403)
+        name = (local_user.business_name or local_user.username or "user").split()[0]
 
-    if not debtor:
-        return Response(
-            {"error": "Mobile number not registered. Please contact your admin."},
-            status=404
-        )
+    # Generate and send OTP
+    otp = "".join(random.choices(string.digits, k=6))
+    cache.set(f"otp_{phone_number}", otp, timeout=300)
 
-    debtor_code = (debtor.get("code") or "").strip()
-    debtor_name = (debtor.get("name") or "").strip()
+    print(f"[OTP] Generated OTP {otp} for {phone_number}")
 
-    user, created = User.objects.get_or_create(
-        phone_number=phone_number,
-        defaults={
-            "username":      f"debtor_{debtor_code}_{phone_number}",
-            "user_type":     "user",
-            "status":        "Active",
-            "business_name": debtor_name,
-            "location":      debtor.get("place") or "",
-        }
-    )
+    sent, err_msg = _send_whatsapp_otp(phone_number, otp, name)
 
-    if _block_if_disabled(user):
-        return Response({"error": "Your account is disabled. Please contact admin."}, status=403)
+    if not sent:
+        print(f"[OTP] AiSensy send failed for {phone_number}: {err_msg}")
+        return Response({
+            "message":      f"OTP generated for number ending in {phone_number[-4:]}. Check terminal.",
+            "phone_number": phone_number,
+            "requires_otp": True,
+            # ── REMOVE dev_otp in production ──
+            "dev_otp":      otp,
+        })
 
-    refresh = RefreshToken.for_user(user)
     return Response({
-        "access":  str(refresh.access_token),
-        "refresh": str(refresh),
-        "user": {
-            **UserPublicSerializer(user).data,
-            "debtor_code": debtor_code,
-            "debtor_name": debtor_name,
-            "place":       debtor.get("place") or "",
-            "balance":     debtor.get("exregnodate") or "0",
-        }
+        "message":      f"OTP sent to WhatsApp number ending in {phone_number[-4:]}",
+        "phone_number": phone_number,
+        "requires_otp": True,
     })
 
 
@@ -196,9 +204,9 @@ def user_login(request):
 def _send_whatsapp_otp(phone_number: str, otp: str, name: str = "user") -> tuple:
     payload = {
         "apiKey":         AISENSY_API_KEY,
-        "campaignName":   "app notif",
+        "campaignName":   AISENSY_CAMPAIGN,
         "destination":    f"91{phone_number}",
-        "userName":       "vcaremart",
+        "userName":       AISENSY_USERNAME,
         "templateParams": [name],
         "source":         "otp-login",
         "media":          {},

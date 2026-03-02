@@ -64,7 +64,7 @@ urlpatterns = [
     # ---------- USER INVOICES ----------
     path('invoices/my/', views.user_invoices, name='user-invoices'),
 
-    # ---------- ADMIN ----------
+    # ---------- ADMIN  ----------
     path('admins/stats/', views.AdminStatsView.as_view(), name='admin-stats'),
     path('admins/', views.AdminListView.as_view(), name='admin-list'),
     path('admins/<int:pk>/', views.AdminDetailView.as_view(), name='admin-detail'),
