@@ -5,7 +5,7 @@ from .views import public_branch_offers
 urlpatterns = [
     # ---------- AUTH ----------
     path('admin/login/', views.admin_login, name='admin-login'),
-    path('user/login/', views.user_login, name='user-login'),
+    # path('user/login/', views.user_login, name='user-login'),
     path('user/request-otp/', views.user_request_otp, name='user-request-otp'),
     path('user/verify-otp/', views.user_verify_otp, name='user-verify-otp'),
     path('register/', views.register_user, name='register-user'),
@@ -69,6 +69,17 @@ urlpatterns = [
     path('admins/', views.AdminListView.as_view(), name='admin-list'),
     path('admins/<int:pk>/', views.AdminDetailView.as_view(), name='admin-detail'),
 
+   path('misel/', views.misel_list, name='misel-list'),
+   path('misel/<int:pk>/', views.misel_detail, name='misel-detail'), 
 
 
+
+
+# apiurl
+# ---------- INVOICES (Admin) ----------
+path('invoices/', views.acc_inv_mast_list, name='invoice-list'),
+path('invoices/<int:pk>/', views.acc_inv_mast_detail, name='invoice-detail'),
+
+path('acc-master/', views.acc_master_list, name='acc-master-list'),
+path('acc-master/<int:pk>/', views.acc_master_detail, name='acc-master-detail'),
 ]
